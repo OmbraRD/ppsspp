@@ -947,6 +947,7 @@
     <ClCompile Include="Util\VideoPlayer.cpp" />
     <ClCompile Include="WaveFile.cpp" />
     <ClCompile Include="WebServer.cpp" />
+    <ClCompile Include="MCPServer.cpp" />
     <ClCompile Include="MIPS\x86\X64IRRegCache.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -1295,6 +1296,7 @@
     <ClInclude Include="Util\VideoPlayer.h" />
     <ClInclude Include="WaveFile.h" />
     <ClInclude Include="WebServer.h" />
+    <ClInclude Include="MCPServer.h" />
     <ClInclude Include="MIPS\x86\X64IRRegCache.h" />
   </ItemGroup>
   <ItemGroup>

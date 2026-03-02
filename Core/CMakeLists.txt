@@ -680,6 +680,8 @@ add_library(Core STATIC
 	MemFault.cpp
 	MemFault.h
 	MemMap.cpp
+	MCPServer.cpp
+	MCPServer.h
 	MemMap.h
 	MemMapFunctions.cpp
 	MemMapHelpers.h

@@ -331,6 +331,7 @@
     <ClInclude Include="..\..\Core\Util\RecentFiles.h" />
     <ClInclude Include="..\..\Core\Util\VideoPlayer.h" />
     <ClInclude Include="..\..\Core\WebServer.h" />
+    <ClInclude Include="..\..\Core\MCPServer.h" />
     <ClInclude Include="..\..\Core\Util\AudioFormat.h" />
     <ClInclude Include="..\..\Core\Util\BlockAllocator.h" />
     <ClInclude Include="..\..\Core\Util\DisArm64.h" />
@@ -650,6 +651,7 @@
     <ClCompile Include="..\..\Core\Util\RecentFiles.cpp" />
     <ClCompile Include="..\..\Core\Util\VideoPlayer.cpp" />
     <ClCompile Include="..\..\Core\WebServer.cpp" />
+    <ClCompile Include="..\..\Core\MCPServer.cpp" />
     <ClCompile Include="..\..\Core\Util\AudioFormat.cpp" />
     <ClCompile Include="..\..\Core\Util\BlockAllocator.cpp" />
     <ClCompile Include="..\..\Core\Util\DisArm64.cpp" />
