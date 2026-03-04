@@ -251,6 +251,8 @@ public:
 	int iRemoteISOShareType;
 	bool bRemoteDebuggerOnStartup;
 	bool bRemoteDebuggerLocal;
+	bool bEnableMCPServer;
+	int iMCPServerPort;
 	bool bRemoteTab;
 	bool bMemStickInserted;
 	int iMemStickSizeGB;

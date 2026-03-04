@@ -306,6 +306,8 @@ static const ConfigSetting generalSettings[] = {
 	ConfigSetting("RemoteISOSubdir", SETTING(g_Config, sRemoteISOSubdir), "/", CfgFlag::DEFAULT),
 	ConfigSetting("RemoteDebuggerOnStartup", SETTING(g_Config, bRemoteDebuggerOnStartup), false, CfgFlag::DEFAULT),
 	ConfigSetting("RemoteDebuggerLocal", SETTING(g_Config, bRemoteDebuggerLocal), false, CfgFlag::DEFAULT),
+	ConfigSetting("EnableMCPServer", SETTING(g_Config, bEnableMCPServer), false, CfgFlag::DEFAULT),
+	ConfigSetting("MCPServerPort", SETTING(g_Config, iMCPServerPort), 27077, CfgFlag::DEFAULT),
 	ConfigSetting("RemoteTab", SETTING(g_Config, bRemoteTab), false, CfgFlag::DEFAULT),
 	ConfigSetting("RemoteISOSharedDir", SETTING(g_Config, sRemoteISOSharedDir), "", CfgFlag::DEFAULT),
 	ConfigSetting("RemoteISOShareType", SETTING(g_Config, iRemoteISOShareType), (int)RemoteISOShareType::RECENT, CfgFlag::DEFAULT),
