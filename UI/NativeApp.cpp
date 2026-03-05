@@ -124,6 +124,7 @@
 #include "Core/Util/RecentFiles.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/WebServer.h"
+#include "Core/MCPServer.h"
 #include "Core/TiltEventProcessor.h"
 
 #include "GPU/GPUCommon.h"
@@ -835,6 +836,12 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 	if (flags != WebServerFlags::NONE) {
 		StartWebServer(WebServerFlags::ALL);
 	}
+
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
+	if (g_Config.bEnableMCPServer) {
+		StartMCPServer(g_Config.iMCPServerPort);
+	}
+#endif
 
 	std::string sysName = System_GetProperty(SYSPROP_NAME);
 
@@ -1848,6 +1855,10 @@ void NativeShutdown() {
 	g_i18nrepo.LogMissingKeys();
 
 	ShutdownWebServer();
+
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
+	ShutdownMCPServer();
+#endif
 
 	__UPnPShutdown();
 

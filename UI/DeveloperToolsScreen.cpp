@@ -37,6 +37,7 @@
 #include "Core/Core.h"
 #include "Core/System.h"
 #include "Core/WebServer.h"
+#include "Core/MCPServer.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/FileSystems/VirtualDiscFileSystem.h"
 #include "UI/GPUDriverTestScreen.h"
@@ -202,6 +203,13 @@ void DeveloperToolsScreen::CreateGeneralTab(UI::LinearLayout *list) {
 	localDebugger->SetEnabledPtr(&allowDebugger_);
 
 	list->Add(new CheckBox(&g_Config.bAutoSaveLoadSymbols, dev->T("Auto save/load symbols")));
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
+	enableMCPServer_ = MCPServerRunning();
+	CheckBox *mcpServer = list->Add(new CheckBox(&enableMCPServer_, dev->T("Enable MCP server")));
+	mcpServer->OnClick.Handle(this, &DeveloperToolsScreen::OnMCPServer);
+	PopupSliderChoice *mcpPort = list->Add(new PopupSliderChoice(&g_Config.iMCPServerPort, 1024, 65535, 27077, dev->T("MCP server port"), screenManager()));
+	mcpPort->SetEnabledFunc([]() { return !MCPServerRunning(); });
+#endif
 
 	list->Add(new Choice(dev->T("GPI/GPO switches/LEDs")))->OnClick.Add([=](UI::EventParams &e) {
 		screenManager()->push(new GPIGPOScreen(dev->T("GPI/GPO switches/LEDs")));
@@ -740,6 +748,17 @@ void DeveloperToolsScreen::OnRemoteDebugger(UI::EventParams &e) {
 	// Persist the setting.  Maybe should separate?
 	g_Config.bRemoteDebuggerOnStartup = allowDebugger_;
 }
+
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
+void DeveloperToolsScreen::OnMCPServer(UI::EventParams &e) {
+	if (enableMCPServer_) {
+		StartMCPServer(g_Config.iMCPServerPort);
+	} else {
+		ShutdownMCPServer();
+	}
+	g_Config.bEnableMCPServer = enableMCPServer_;
+}
+#endif
 
 void DeveloperToolsScreen::OnMIPSTracerEnabled(UI::EventParams &e) {
 	if (MIPSTracerEnabled_) {

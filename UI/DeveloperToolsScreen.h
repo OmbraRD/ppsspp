@@ -32,6 +32,7 @@ private:
 	void OnJitAffectingSetting(UI::EventParams &e);
 	void OnJitDebugTools(UI::EventParams &e);
 	void OnRemoteDebugger(UI::EventParams &e);
+	void OnMCPServer(UI::EventParams &e);
 	void OnMIPSTracerEnabled(UI::EventParams &e);
 	void OnMIPSTracerPathChanged(UI::EventParams &e);
 	void OnMIPSTracerFlushTrace(UI::EventParams &e);
@@ -45,6 +46,7 @@ private:
 
 	bool allowDebugger_ = false;
 	bool canAllowDebugger_ = true;
+	bool enableMCPServer_ = false;
 	enum class HasIni {
 		NO,
 		YES,
