@@ -22,6 +22,7 @@
     <ClCompile Include="TestVFS.cpp" />
     <ClCompile Include="TestZipSlip.cpp" />
     <ClCompile Include="TestLoongArch64Emitter.cpp" />
+    <ClCompile Include="TestMCPServer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="JitHarness.h" />

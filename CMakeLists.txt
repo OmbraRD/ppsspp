@@ -1359,6 +1359,7 @@ if(UNITTEST)
 		unittest/TestLoongArch64Emitter.cpp
 		unittest/TestSoftwareGPUJit.cpp
 		unittest/TestThreadManager.cpp
+		unittest/TestMCPServer.cpp
 		unittest/JitHarness.cpp
 		Core/MIPS/ARM/ArmRegCache.cpp
 		Core/MIPS/ARM/ArmRegCacheFPU.cpp
@@ -1411,6 +1412,7 @@ if(UNITTEST)
 	add_test(quick_texhash PPSSPPUnitTest QuickTexHash)
 	add_test(clz PPSSPPUnitTest CLZ)
 	add_test(shadergen PPSSPPUnitTest ShaderGenerators)
+	add_test(mcp_server PPSSPPUnitTest MCPServer)
 endif()
 
 if(ATLAS_TOOL)

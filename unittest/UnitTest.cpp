@@ -2890,6 +2890,7 @@ bool TestVFS();
 bool TestZipSlip();
 bool TestLzrc();
 bool TestDemangle();
+bool TestMCPServer();
 
 // Tab/Shift+Tab focus navigation walks the view hierarchy in declaration order rather than by
 // geometry, so what it does is entirely determined by CollectTabOrder - which is worth pinning
@@ -3024,6 +3025,9 @@ TestItem availableTests[] = {
 	TEST_ITEM(Demangle),
 	TEST_ITEM(TextureReplacer),
 	TEST_ITEM(UITabOrder),
+#if !PPSSPP_PLATFORM(ANDROID)
+	TEST_ITEM(MCPServer),
+#endif
 };
 
 int main(int argc, const char *argv[]) {
