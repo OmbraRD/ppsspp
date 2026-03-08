@@ -129,9 +129,9 @@ static std::vector<MCPToolDef> GetToolDefs() {
 	return {
 		{"get_status", "Get the current emulator status (running, paused, stepping, no game loaded).", {}},
 		{"get_game_info", "Get information about the currently loaded game (title, disc ID, version).", {}},
-		{"read_memory", "Read bytes from PSP memory. Returns hex string. Works with RAM (0x08800000), VRAM (0x04000000, 2MB), and scratchpad (0x00010000).", {
+		{"read_memory", "Read bytes from PSP memory. Returns hex string. Memory regions: RAM at 0x08000000 (32MB, or 64MB on Slim), VRAM 2MB at 0x04000000, scratchpad 16KB at 0x00010000. User code starts at 0x08800000.", {
 			{"address", "string", "Memory address to read from. Hex with 0x prefix (e.g. \"0x08800000\") or decimal.", true},
-			{"size", "number", "Number of bytes to read (max 65536).", true},
+			{"size", "number", "Number of bytes to read.", true},
 		}},
 		{"write_memory", "Write bytes to PSP memory.", {
 			{"address", "string", "Memory address to write to. Hex with 0x prefix (e.g. \"0x08800000\") or decimal.", true},
@@ -150,11 +150,12 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"address", "string", "Address to write the assembled instruction. Hex with 0x prefix or decimal.", true},
 			{"instruction", "string", "MIPS assembly instruction (e.g. \"addiu a0, zero, 1\").", true},
 		}},
-		{"search_memory", "Search PSP memory for a byte pattern.", {
+		{"search_memory", "Search PSP memory for a byte pattern within a memory region.", {
 			{"hex", "string", "Hex string pattern to search for.", true},
-			{"start", "string", "Start address (default 0x08800000). Hex with 0x prefix or decimal.", false},
-			{"end", "string", "End address (default 0x0A000000). Hex with 0x prefix or decimal.", false},
-			{"max_results", "number", "Maximum results to return (default 16).", false},
+			{"region", "string", "Memory region to search: 'ram' (default, user RAM), 'vram', 'scratchpad', or 'kernel'. Sets default start/end bounds.", false},
+			{"start", "string", "Start address override. Hex with 0x prefix or decimal.", false},
+			{"end", "string", "End address override. Hex with 0x prefix or decimal.", false},
+			{"max_results", "number", "Maximum results to return (default 16, max 256).", false},
 		}},
 		{"pause", "Pause emulation (break into stepping mode).", {}},
 		{"resume", "Resume emulation from paused/stepping state.", {}},
@@ -271,8 +272,8 @@ static std::string HandleReadMemory(const JsonGet &args) {
 	if (!ParseAddress(args, "address", &addr))
 		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	int size = args.getInt("size", 0);
-	if (size <= 0 || size > 65536)
-		return ToolResultText("size must be between 1 and 65536.", true);
+	if (size <= 0)
+		return ToolResultText("size must be positive.", true);
 
 	if (!Memory::IsValidRange(addr, size))
 		return ToolResultText("Invalid memory address or range.", true);
@@ -473,9 +474,36 @@ static std::string HandleSearchMemory(const JsonGet &args) {
 		pattern[i] = (uint8_t)byte;
 	}
 
+	// Determine region defaults.
+	uint32_t regionStart = PSP_GetUserMemoryBase();
+	uint32_t regionEnd = PSP_GetUserMemoryEnd();
+	std::string region;
+	if (args.getString("region", &region)) {
+		if (region == "ram") {
+			regionStart = PSP_GetUserMemoryBase();
+			regionEnd = PSP_GetUserMemoryEnd();
+		} else if (region == "kernel") {
+			regionStart = PSP_GetKernelMemoryBase();
+			regionEnd = PSP_GetKernelMemoryEnd();
+		} else if (region == "vram") {
+			regionStart = PSP_GetVidMemBase();
+			regionEnd = PSP_GetVidMemEnd();
+		} else if (region == "scratchpad") {
+			regionStart = PSP_GetScratchpadMemoryBase();
+			regionEnd = PSP_GetScratchpadMemoryEnd();
+		} else {
+			return ToolResultText("Unknown region. Use 'ram', 'vram', 'scratchpad', or 'kernel'.", true);
+		}
+	}
+
 	uint32_t start, end;
-	ParseAddress(args, "start", &start, 0x08800000);
-	ParseAddress(args, "end", &end, 0x0A000000);
+	ParseAddress(args, "start", &start, regionStart);
+	ParseAddress(args, "end", &end, regionEnd);
+
+	// Validate that overrides stay within the region bounds.
+	if (start < regionStart || end > regionEnd || start >= end)
+		return ToolResultText("start/end out of region bounds.", true);
+
 	int maxResults = args.getInt("max_results", 16);
 	if (maxResults > 256) maxResults = 256;
 
