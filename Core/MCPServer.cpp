@@ -171,14 +171,28 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		{"resume", "Resume emulation from paused/stepping state.", {}},
 		{"step_into", "Step one instruction (into function calls). Must be paused first.", {}},
 		{"list_threads", "List PSP kernel threads with their status and PC.", {}},
-		{"set_breakpoint", "Set a CPU breakpoint at the given address.", {
+		{"set_breakpoint", "Set a CPU execution breakpoint at the given address.", {
 			{"address", "string", "Address to set breakpoint at. Hex with 0x prefix or decimal.", true},
 			{"enabled", "boolean", "Whether the breakpoint is enabled (default true).", false},
+			{"condition", "string", "Expression that must be true for the breakpoint to trigger (e.g. \"a0 == 1\" or \"[sp+0x10] != 0\").", false},
 		}},
-		{"remove_breakpoint", "Remove a CPU breakpoint.", {
+		{"remove_breakpoint", "Remove a CPU execution breakpoint.", {
 			{"address", "string", "Address of breakpoint to remove. Hex with 0x prefix or decimal.", true},
 		}},
-		{"list_breakpoints", "List all CPU breakpoints.", {}},
+		{"set_memcheck", "Set a memory watchpoint that triggers on read/write/change to an address range.", {
+			{"address", "string", "Start address of memory range. Hex with 0x prefix or decimal.", true},
+			{"size", "number", "Size of memory range in bytes.", true},
+			{"read", "boolean", "Trigger on memory reads (default false).", false},
+			{"write", "boolean", "Trigger on memory writes (default true).", false},
+			{"change", "boolean", "Trigger only on writes that change the value (default false).", false},
+			{"enabled", "boolean", "Whether the watchpoint is enabled (default true).", false},
+			{"condition", "string", "Expression that must be true for the watchpoint to trigger.", false},
+		}},
+		{"remove_memcheck", "Remove a memory watchpoint.", {
+			{"address", "string", "Start address of the watchpoint. Hex with 0x prefix or decimal.", true},
+			{"size", "number", "Size of the watchpoint range in bytes.", true},
+		}},
+		{"list_breakpoints", "List all CPU breakpoints and memory watchpoints.", {}},
 		{"lookup_symbol", "Look up a symbol name by address, or an address by symbol name.", {
 			{"address", "string", "Address to look up. Hex with 0x prefix or decimal.", false},
 			{"name", "string", "Symbol name to look up.", false},
@@ -648,12 +662,25 @@ static std::string HandleSetBreakpoint(const JsonGet &args) {
 	bool enabled = args.getBool("enabled", true);
 
 	g_breakpoints.AddBreakPoint(addr, false);
-	if (!enabled) {
+	if (!enabled)
 		g_breakpoints.ChangeBreakPoint(addr, false);
+
+	std::string condition;
+	if (args.getString("condition", &condition) && !condition.empty()) {
+		PostfixExpression postfix;
+		if (!initExpression(currentDebugMIPS, condition.c_str(), postfix))
+			return ToolResultText(std::string("Breakpoint set but condition failed to parse: ") + getExpressionError(), true);
+		BreakPointCond cond;
+		cond.debug = currentDebugMIPS;
+		cond.expressionString = condition;
+		cond.expression = postfix;
+		g_breakpoints.ChangeBreakPointAddCond(addr, cond);
 	}
 
-	char msg[128];
-	snprintf(msg, sizeof(msg), "Breakpoint set at 0x%08X (%s).", addr, enabled ? "enabled" : "disabled");
+	char msg[256];
+	snprintf(msg, sizeof(msg), "Breakpoint set at 0x%08X (%s)%s.", addr,
+		enabled ? "enabled" : "disabled",
+		condition.empty() ? "" : " with condition");
 	return ToolResultText(msg);
 }
 
@@ -671,8 +698,71 @@ static std::string HandleRemoveBreakpoint(const JsonGet &args) {
 	return ToolResultText(msg);
 }
 
+static std::string HandleSetMemcheck(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
+	int size = args.getInt("size", 0);
+	if (size <= 0)
+		return ToolResultText("size must be positive.", true);
+	uint32_t end = addr + size;
+
+	bool read = args.getBool("read", false);
+	bool write = args.getBool("write", true);
+	bool change = args.getBool("change", false);
+	bool enabled = args.getBool("enabled", true);
+
+	int bits = (read ? MEMCHECK_READ : 0) | (write ? MEMCHECK_WRITE : 0) | (change ? MEMCHECK_WRITE_ONCHANGE : 0);
+	if (bits == 0)
+		return ToolResultText("At least one of read, write, or change must be true.", true);
+
+	BreakAction result = enabled ? BREAK_ACTION_PAUSE : BREAK_ACTION_IGNORE;
+	g_breakpoints.AddMemCheck(addr, end, MemCheckCondition(bits), result);
+
+	std::string condition;
+	if (args.getString("condition", &condition) && !condition.empty()) {
+		PostfixExpression postfix;
+		if (!initExpression(currentDebugMIPS, condition.c_str(), postfix))
+			return ToolResultText(std::string("Watchpoint set but condition failed to parse: ") + getExpressionError(), true);
+		BreakPointCond cond;
+		cond.debug = currentDebugMIPS;
+		cond.expressionString = condition;
+		cond.expression = postfix;
+		g_breakpoints.ChangeMemCheckAddCond(addr, end, cond);
+	}
+
+	char msg[256];
+	snprintf(msg, sizeof(msg), "Watchpoint set at 0x%08X-0x%08X (%s%s%s)%s.", addr, end,
+		read ? "read " : "", write ? "write " : "", change ? "change " : "",
+		condition.empty() ? "" : " with condition");
+	return ToolResultText(msg);
+}
+
+static std::string HandleRemoveMemcheck(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
+	int size = args.getInt("size", 0);
+	if (size <= 0)
+		return ToolResultText("size must be positive.", true);
+	uint32_t end = addr + size;
+
+	g_breakpoints.RemoveMemCheck(addr, end);
+
+	char msg[128];
+	snprintf(msg, sizeof(msg), "Watchpoint removed at 0x%08X-0x%08X.", addr, end);
+	return ToolResultText(msg);
+}
+
 static std::string HandleListBreakpoints(const JsonGet &args) {
 	auto bps = g_breakpoints.GetBreakpoints();
+	auto mcs = g_breakpoints.GetMemChecks();
 	JsonWriter j;
 	j.begin();
 	j.pushArray("breakpoints");
@@ -680,11 +770,29 @@ static std::string HandleListBreakpoints(const JsonGet &args) {
 		if (bp.temporary)
 			continue;
 		j.pushDict();
+		j.writeString("type", "execute");
 		WriteHexU32(j, "address", bp.addr);
 		j.writeBool("enabled", bp.IsEnabled());
+		if (bp.hasCond)
+			j.writeString("condition", bp.cond.expressionString);
 		const std::string sym = g_symbolMap->GetLabelString(bp.addr);
 		if (!sym.empty())
 			j.writeString("symbol", sym);
+		j.pop();
+	}
+	for (auto &mc : mcs) {
+		j.pushDict();
+		j.writeString("type", "memory");
+		WriteHexU32(j, "address", mc.start);
+		WriteHexU32(j, "end", mc.end);
+		j.writeInt("size", mc.end - mc.start);
+		j.writeBool("enabled", mc.IsEnabled());
+		j.writeBool("read", (mc.cond & MEMCHECK_READ) != 0);
+		j.writeBool("write", (mc.cond & MEMCHECK_WRITE) != 0);
+		j.writeBool("change", (mc.cond & MEMCHECK_WRITE_ONCHANGE) != 0);
+		if (mc.hasCondition)
+			j.writeString("condition", mc.condition.expressionString);
+		j.writeInt("hits", mc.numHits);
 		j.pop();
 	}
 	j.pop();
@@ -1020,6 +1128,8 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"list_threads", HandleListThreads},
 		{"set_breakpoint", HandleSetBreakpoint},
 		{"remove_breakpoint", HandleRemoveBreakpoint},
+		{"set_memcheck", HandleSetMemcheck},
+		{"remove_memcheck", HandleRemoveMemcheck},
 		{"list_breakpoints", HandleListBreakpoints},
 		{"lookup_symbol", HandleLookupSymbol},
 		{"take_screenshot", HandleTakeScreenshot},
