@@ -236,6 +236,7 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"count", "number", "Number of events to skip before breaking (default 1).", false},
 		}},
 		{"get_gpu_stats", "Get GPU rendering statistics for the current/last frame.", {}},
+		{"get_current_vertices", "Get the transformed vertices for the current draw call. Must be paused at a GE draw command (use set_ge_break_on with 'draw' or 'prim').", {}},
 	};
 }
 
@@ -1447,6 +1448,54 @@ static std::string HandleGetGPUStats(const JsonGet &args) {
 	return ToolResultText(j.str());
 }
 
+static std::string HandleGetCurrentVertices(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	int count = gpuDebug->GetCurrentPrimCount();
+	if (count <= 0)
+		return ToolResultText("No draw call in progress. Break on a draw command first (use set_ge_break_on with 'draw').", true);
+
+	std::vector<GPUDebugVertex> vertices;
+	std::vector<u16> indices;
+	if (!gpuDebug->GetCurrentDrawAsDebugVertices(count, vertices, indices))
+		return ToolResultText("Failed to get vertex data.", true);
+
+	JsonWriter j;
+	j.begin();
+	j.writeInt("vertex_count", (int)vertices.size());
+	j.writeInt("index_count", (int)indices.size());
+	j.pushArray("vertices");
+	for (const auto &v : vertices) {
+		j.pushDict();
+		j.writeFloat("x", v.x);
+		j.writeFloat("y", v.y);
+		j.writeFloat("z", v.z);
+		j.writeFloat("u", v.u);
+		j.writeFloat("v", v.v);
+		j.writeFloat("nx", v.nx);
+		j.writeFloat("ny", v.ny);
+		j.writeFloat("nz", v.nz);
+		char color[16];
+		snprintf(color, sizeof(color), "#%02X%02X%02X%02X", v.c[0], v.c[1], v.c[2], v.c[3]);
+		j.writeString("color", color);
+		j.pop();
+	}
+	j.pop();
+	if (!indices.empty()) {
+		j.pushArray("indices");
+		for (u16 idx : indices) {
+			j.writeInt(idx);
+		}
+		j.pop();
+	}
+	j.end();
+	return ToolResultText(j.str());
+}
+
 typedef std::string (*ToolHandler)(const JsonGet &args);
 static std::map<std::string, ToolHandler> &GetToolHandlers() {
 	static std::map<std::string, ToolHandler> handlers = {
@@ -1484,6 +1533,7 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"remove_ge_breakpoint", HandleRemoveGEBreakpoint},
 		{"set_ge_break_on", HandleSetGEBreakOn},
 		{"get_gpu_stats", HandleGetGPUStats},
+		{"get_current_vertices", HandleGetCurrentVertices},
 	};
 	return handlers;
 }
