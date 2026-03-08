@@ -237,6 +237,9 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		}},
 		{"get_gpu_stats", "Get GPU rendering statistics for the current/last frame.", {}},
 		{"get_current_vertices", "Get the transformed vertices for the current draw call. Must be paused at a GE draw command (use set_ge_break_on with 'draw' or 'prim').", {}},
+		{"get_gpu_matrices", "Get GPU transformation matrices.", {
+			{"name", "string", "Matrix name: 'world' (4x3), 'view' (4x3), 'projection' (4x4), 'texgen' (4x3), 'bone' (all 8 bone matrices, each 4x3), or 'all' (default).", false},
+		}},
 	};
 }
 
@@ -1137,11 +1140,64 @@ static std::string HandleGEDisassemble(const JsonGet &args) {
 	return ToolResultText(result);
 }
 
+static u8 *ConvertDepthStencilToRGB(const GPUDebugBuffer &buffer, u32 w, u32 h) {
+	u8 *rgb = new u8[w * h * 3];
+	GPUDebugBufferFormat fmt = buffer.GetFormat();
+	bool flipped = buffer.GetFlipped();
+
+	for (u32 y = 0; y < h; y++) {
+		u32 srcY = flipped ? (h - 1 - y) : y;
+		for (u32 x = 0; x < w; x++) {
+			u32 raw = buffer.GetRawPixel(x, srcY);
+			u8 val;
+			switch (fmt) {
+			case GPU_DBG_FORMAT_FLOAT:
+			case GPU_DBG_FORMAT_FLOAT_DIV_256: {
+				float f;
+				memcpy(&f, &raw, sizeof(float));
+				if (fmt == GPU_DBG_FORMAT_FLOAT_DIV_256)
+					f /= 256.0f;
+				val = (u8)(std::min(std::max(f, 0.0f), 1.0f) * 255.0f);
+				break;
+			}
+			case GPU_DBG_FORMAT_24BIT_8X:
+			case GPU_DBG_FORMAT_24BIT_8X_DIV_256:
+				val = (u8)((raw >> 16) & 0xFF);
+				break;
+			case GPU_DBG_FORMAT_24X_8BIT:
+				val = (u8)(raw & 0xFF);
+				break;
+			case GPU_DBG_FORMAT_16BIT:
+				val = (u8)((raw >> 8) & 0xFF);
+				break;
+			case GPU_DBG_FORMAT_8BIT:
+				val = (u8)(raw & 0xFF);
+				break;
+			default:
+				val = (u8)((raw >> 8) & 0xFF);
+				break;
+			}
+			u8 *dst = &rgb[(y * w + x) * 3];
+			dst[0] = dst[1] = dst[2] = val;
+		}
+	}
+	return rgb;
+}
+
 static std::string GPUDebugBufferToPNG(const GPUDebugBuffer &buffer) {
-	u8 *flipbuffer = nullptr;
 	u32 w = buffer.GetStride();
 	u32 h = buffer.GetHeight();
-	const u8 *rgb = ConvertBufferToScreenshot(buffer, false, flipbuffer, w, h);
+	u8 *flipbuffer = nullptr;
+	const u8 *rgb = nullptr;
+
+	GPUDebugBufferFormat fmt = buffer.GetFormat();
+	if (fmt >= GPU_DBG_FORMAT_FLOAT) {
+		flipbuffer = ConvertDepthStencilToRGB(buffer, w, h);
+		rgb = flipbuffer;
+	} else {
+		rgb = ConvertBufferToScreenshot(buffer, false, flipbuffer, w, h);
+	}
+
 	if (!rgb) {
 		delete[] flipbuffer;
 		return ToolResultText("Failed to convert buffer data.", true);
@@ -1496,6 +1552,50 @@ static std::string HandleGetCurrentVertices(const JsonGet &args) {
 	return ToolResultText(j.str());
 }
 
+static void WriteMatrix(JsonWriter &j, const char *name, const float *m, int rows, int cols) {
+	j.pushArray(name);
+	for (int r = 0; r < rows; r++) {
+		j.pushArray();
+		for (int c = 0; c < cols; c++)
+			j.writeFloat(m[r * cols + c]);
+		j.pop();
+	}
+	j.pop();
+}
+
+static std::string HandleGetGPUMatrices(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	std::string name;
+	args.getString("name", &name);
+	if (name.empty()) name = "all";
+
+	const GPUgstate &gs = gpuDebug->GetGState();
+
+	JsonWriter j;
+	j.begin();
+	if (name == "all" || name == "world")
+		WriteMatrix(j, "world", gs.worldMatrix, 4, 3);
+	if (name == "all" || name == "view")
+		WriteMatrix(j, "view", gs.viewMatrix, 4, 3);
+	if (name == "all" || name == "projection")
+		WriteMatrix(j, "projection", gs.projMatrix, 4, 4);
+	if (name == "all" || name == "texgen")
+		WriteMatrix(j, "texgen", gs.tgenMatrix, 4, 3);
+	if (name == "all" || name == "bone") {
+		j.pushDict("bone");
+		for (int i = 0; i < 8; i++) {
+			char boneName[16];
+			snprintf(boneName, sizeof(boneName), "bone%d", i);
+			WriteMatrix(j, boneName, &gs.boneMatrix[i * 12], 4, 3);
+		}
+		j.pop();
+	}
+	j.end();
+	return ToolResultText(j.str());
+}
+
 typedef std::string (*ToolHandler)(const JsonGet &args);
 static std::map<std::string, ToolHandler> &GetToolHandlers() {
 	static std::map<std::string, ToolHandler> handlers = {
@@ -1534,6 +1634,7 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"set_ge_break_on", HandleSetGEBreakOn},
 		{"get_gpu_stats", HandleGetGPUStats},
 		{"get_current_vertices", HandleGetCurrentVertices},
+		{"get_gpu_matrices", HandleGetGPUMatrices},
 	};
 	return handlers;
 }
