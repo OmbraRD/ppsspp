@@ -49,6 +49,9 @@
 #include "Core/ELF/ParamSFO.h"
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/Screenshot.h"
+#include "GPU/GPU.h"
+#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GeDisasm.h"
 #include "Core/Util/PathUtil.h"
 #include "Common/File/FileUtil.h"
 
@@ -175,6 +178,11 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		}},
 		{"take_screenshot", "Capture a screenshot of the current PSP display as a PNG image.", {
 			{"type", "string", "Screenshot type: 'display' (default, game output) or 'render' (in-progress render).", false},
+		}},
+		{"ge_list_display_lists", "List active GE (GPU) display lists with their status, PC, and stall address.", {}},
+		{"ge_disassemble", "Disassemble GE (GPU) display list commands at a given address. Returns human-readable GPU command descriptions.", {
+			{"address", "string", "Start address to disassemble. Hex with 0x prefix or decimal.", true},
+			{"count", "number", "Number of GE commands to disassemble (default 32, max 256).", false},
 		}},
 	};
 }
@@ -766,6 +774,76 @@ static std::string HandleTakeScreenshot(const JsonGet &args) {
 	return ToolResultImage(base64, "image/png");
 }
 
+static const char *DisplayListStateToString(DisplayListState state) {
+	switch (state) {
+	case PSP_GE_DL_STATE_NONE: return "none";
+	case PSP_GE_DL_STATE_QUEUED: return "queued";
+	case PSP_GE_DL_STATE_RUNNING: return "running";
+	case PSP_GE_DL_STATE_COMPLETED: return "completed";
+	case PSP_GE_DL_STATE_PAUSED: return "paused";
+	default: return "unknown";
+	}
+}
+
+static std::string HandleGEListDisplayLists(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	auto lists = gpuDebug->ActiveDisplayLists();
+	if (lists.empty())
+		return ToolResultText("No active display lists.");
+
+	JsonWriter j;
+	j.begin();
+	j.pushArray("display_lists");
+	for (const auto &dl : lists) {
+		j.pushDict();
+		j.writeInt("id", dl.id);
+		j.writeString("state", DisplayListStateToString(dl.state));
+		WriteHexU32(j, "start_pc", dl.startpc);
+		WriteHexU32(j, "pc", dl.pc);
+		WriteHexU32(j, "stall", dl.stall);
+		j.writeInt("stack_depth", dl.stackptr);
+		j.pop();
+	}
+	j.pop();
+	j.end();
+	return ToolResultText(j.str());
+}
+
+static std::string HandleGEDisassemble(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
+
+	int count = args.getInt("count", 32);
+	if (count <= 0) count = 32;
+	if (count > 256) count = 256;
+
+	if (!Memory::IsValidAddress(addr))
+		return ToolResultText("Invalid memory address.", true);
+
+	std::string result;
+	for (int i = 0; i < count; i++) {
+		uint32_t cmdAddr = addr + i * 4;
+		if (!Memory::IsValidAddress(cmdAddr))
+			break;
+		uint32_t op = Memory::Read_U32(cmdAddr);
+		GPUDebugOp decoded = gpuDebug->DisassembleOp(cmdAddr, op);
+		char line[512];
+		snprintf(line, sizeof(line), "0x%08X: [%08X] %s\n", cmdAddr, op, decoded.desc.c_str());
+		result += line;
+
+		// Stop after END command.
+		if (decoded.cmd == GE_CMD_END)
+			break;
+	}
+	return ToolResultText(result);
+}
+
 typedef std::string (*ToolHandler)(const JsonGet &args);
 static std::map<std::string, ToolHandler> &GetToolHandlers() {
 	static std::map<std::string, ToolHandler> handlers = {
@@ -787,6 +865,8 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"list_breakpoints", HandleListBreakpoints},
 		{"lookup_symbol", HandleLookupSymbol},
 		{"take_screenshot", HandleTakeScreenshot},
+		{"ge_list_display_lists", HandleGEListDisplayLists},
+		{"ge_disassemble", HandleGEDisassemble},
 	};
 	return handlers;
 }
