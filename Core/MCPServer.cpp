@@ -55,6 +55,8 @@
 #include "Core/Screenshot.h"
 #include "GPU/GPU.h"
 #include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/Common/FramebufferManagerCommon.h"
+#include "GPU/Debugger/Stepping.h"
 #include "GPU/GeDisasm.h"
 #include "Core/Util/PathUtil.h"
 #include "Common/File/FileUtil.h"
@@ -183,6 +185,10 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		}},
 		{"take_screenshot", "Capture a screenshot of the current PSP display as a PNG image.", {
 			{"type", "string", "Screenshot type: 'display' (default, game output) or 'render' (in-progress render).", false},
+		}},
+		{"list_framebuffers", "List all active virtual framebuffers tracked by the GPU, with VRAM address, dimensions, format, and depth address.", {}},
+		{"get_framebuffer", "Dump a framebuffer as a PNG image. Emulator must be paused.", {
+			{"address", "string", "VRAM address of the framebuffer to dump. Use list_framebuffers to find addresses. Hex with 0x prefix or decimal.", true},
 		}},
 		{"list_hle_modules", "List HLE modules and functions imported by the running game.", {}},
 		{"ge_list_display_lists", "List active GE (GPU) display lists with their status, PC, and stall address.", {}},
@@ -795,6 +801,93 @@ static std::string HandleTakeScreenshot(const JsonGet &args) {
 	return ToolResultImage(base64, "image/png");
 }
 
+static std::string HandleListFramebuffers(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	auto list = gpuDebug->GetFramebufferList();
+	if (list.empty())
+		return ToolResultText("No active framebuffers.");
+
+	JsonWriter j;
+	j.begin();
+	j.pushArray("framebuffers");
+	for (const auto *vfb : list) {
+		j.pushDict();
+		WriteHexU32(j, "fb_address", vfb->fb_address);
+		WriteHexU32(j, "z_address", vfb->z_address);
+		j.writeInt("width", vfb->width);
+		j.writeInt("height", vfb->height);
+		j.writeInt("stride", vfb->fb_stride);
+		j.writeString("format", GeBufferFormatToString(vfb->fb_format));
+		j.writeInt("last_frame_used", vfb->last_frame_used);
+		j.writeInt("last_frame_displayed", vfb->last_frame_displayed);
+		j.pop();
+	}
+	j.pop();
+	j.end();
+	return ToolResultText(j.str());
+}
+
+static std::string HandleGetFramebuffer(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
+
+	// Find the framebuffer at this address.
+	auto list = gpuDebug->GetFramebufferList();
+	const VirtualFramebuffer *target = nullptr;
+	for (const auto *vfb : list) {
+		if (vfb->fb_address == addr) {
+			target = vfb;
+			break;
+		}
+	}
+	if (!target)
+		return ToolResultText("No framebuffer found at that address. Use list_framebuffers to see active framebuffers.", true);
+
+	// Get the framebuffer data via the debug interface.
+	GPUDebugBuffer buffer;
+	if (!gpuDebug->GetFramebufferManagerCommon()->GetFramebuffer(target->fb_address, target->fb_stride, target->fb_format, buffer, 1)) {
+		return ToolResultText("Failed to read framebuffer data.", true);
+	}
+
+	// Convert to RGB888 and save as PNG to a temp file.
+	u8 *flipbuffer = nullptr;
+	u32 w = buffer.GetStride();
+	u32 h = buffer.GetHeight();
+	const u8 *rgb = ConvertBufferToScreenshot(buffer, false, flipbuffer, w, h);
+	if (!rgb) {
+		return ToolResultText("Failed to convert framebuffer data.", true);
+	}
+
+	Path screenshotDir = GetSysDirectory(DIRECTORY_SCREENSHOT);
+	File::CreateDir(screenshotDir);
+	Path tempPath = screenshotDir / ".mcp_framebuffer.png";
+
+	bool saved = Save888RGBScreenshot(tempPath, ScreenshotFormat::PNG, rgb, w, h);
+	delete[] flipbuffer;
+	if (!saved)
+		return ToolResultText("Failed to save framebuffer as PNG.", true);
+
+	size_t fileSize;
+	uint8_t *fileData = File::ReadLocalFile(tempPath, &fileSize);
+	if (!fileData || fileSize == 0)
+		return ToolResultText("Failed to read framebuffer PNG.", true);
+
+	std::string base64 = Base64Encode(fileData, fileSize);
+	delete[] fileData;
+	File::Delete(tempPath);
+
+	return ToolResultImage(base64, "image/png");
+}
+
 static const char *DisplayListStateToString(DisplayListState state) {
 	switch (state) {
 	case PSP_GE_DL_STATE_NONE: return "none";
@@ -930,6 +1023,8 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"list_breakpoints", HandleListBreakpoints},
 		{"lookup_symbol", HandleLookupSymbol},
 		{"take_screenshot", HandleTakeScreenshot},
+		{"list_framebuffers", HandleListFramebuffers},
+		{"get_framebuffer", HandleGetFramebuffer},
 		{"list_hle_modules", HandleListHLEModules},
 		{"ge_list_display_lists", HandleGEListDisplayLists},
 		{"ge_disassemble", HandleGEDisassemble},
