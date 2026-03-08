@@ -130,11 +130,11 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		{"get_status", "Get the current emulator status (running, paused, stepping, no game loaded).", {}},
 		{"get_game_info", "Get information about the currently loaded game (title, disc ID, version).", {}},
 		{"read_memory", "Read bytes from PSP memory. Returns hex string. Works with RAM (0x08800000), VRAM (0x04000000, 2MB), and scratchpad (0x00010000).", {
-			{"address", "number", "Memory address to read from (PSP address space, e.g. 0x08800000 for RAM, 0x04000000 for VRAM).", true},
+			{"address", "string", "Memory address to read from. Hex with 0x prefix (e.g. \"0x08800000\") or decimal.", true},
 			{"size", "number", "Number of bytes to read (max 65536).", true},
 		}},
 		{"write_memory", "Write bytes to PSP memory.", {
-			{"address", "number", "Memory address to write to.", true},
+			{"address", "string", "Memory address to write to. Hex with 0x prefix (e.g. \"0x08800000\") or decimal.", true},
 			{"hex", "string", "Hex string of bytes to write (e.g. \"0102AABB\").", true},
 		}},
 		{"read_registers", "Read CPU registers. Returns all GPR registers, HI, LO, and PC.", {}},
@@ -143,17 +143,17 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"value", "number", "Value to write.", true},
 		}},
 		{"disassemble", "Disassemble MIPS instructions at a given address.", {
-			{"address", "number", "Start address to disassemble.", true},
+			{"address", "string", "Start address to disassemble. Hex with 0x prefix or decimal.", true},
 			{"count", "number", "Number of instructions to disassemble (default 16, max 256).", false},
 		}},
 		{"assemble", "Assemble a single MIPS instruction and write it to memory.", {
-			{"address", "number", "Address to write the assembled instruction.", true},
+			{"address", "string", "Address to write the assembled instruction. Hex with 0x prefix or decimal.", true},
 			{"instruction", "string", "MIPS assembly instruction (e.g. \"addiu a0, zero, 1\").", true},
 		}},
 		{"search_memory", "Search PSP memory for a byte pattern.", {
 			{"hex", "string", "Hex string pattern to search for.", true},
-			{"start", "number", "Start address (default 0x08800000).", false},
-			{"end", "number", "End address (default 0x0A000000).", false},
+			{"start", "string", "Start address (default 0x08800000). Hex with 0x prefix or decimal.", false},
+			{"end", "string", "End address (default 0x0A000000). Hex with 0x prefix or decimal.", false},
 			{"max_results", "number", "Maximum results to return (default 16).", false},
 		}},
 		{"pause", "Pause emulation (break into stepping mode).", {}},
@@ -161,21 +161,47 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		{"step_into", "Step one instruction (into function calls). Must be paused first.", {}},
 		{"list_threads", "List PSP kernel threads with their status and PC.", {}},
 		{"set_breakpoint", "Set a CPU breakpoint at the given address.", {
-			{"address", "number", "Address to set breakpoint at.", true},
+			{"address", "string", "Address to set breakpoint at. Hex with 0x prefix or decimal.", true},
 			{"enabled", "boolean", "Whether the breakpoint is enabled (default true).", false},
 		}},
 		{"remove_breakpoint", "Remove a CPU breakpoint.", {
-			{"address", "number", "Address of breakpoint to remove.", true},
+			{"address", "string", "Address of breakpoint to remove. Hex with 0x prefix or decimal.", true},
 		}},
 		{"list_breakpoints", "List all CPU breakpoints.", {}},
 		{"lookup_symbol", "Look up a symbol name by address, or an address by symbol name.", {
-			{"address", "number", "Address to look up.", false},
+			{"address", "string", "Address to look up. Hex with 0x prefix or decimal.", false},
 			{"name", "string", "Symbol name to look up.", false},
 		}},
 		{"take_screenshot", "Capture a screenshot of the current PSP display as a PNG image.", {
 			{"type", "string", "Screenshot type: 'display' (default, game output) or 'render' (in-progress render).", false},
 		}},
 	};
+}
+
+// Parse an address parameter that may be a JSON number or a string.
+// Accepts numbers or strings with auto-detection: 0x prefix for hex, otherwise decimal.
+static bool ParseAddress(const JsonGet &args, const char *name, uint32_t *out, uint32_t defaultValue = 0) {
+	const JsonNode *node = args.get(name);
+	if (!node) {
+		*out = defaultValue;
+		return false;
+	}
+	if (node->value.getTag() == JSON_NUMBER) {
+		*out = (uint32_t)node->value.toNumber();
+		return true;
+	}
+	if (node->value.getTag() == JSON_STRING) {
+		const char *s = node->value.toString();
+		if (!s || !*s) {
+			*out = defaultValue;
+			return false;
+		}
+		char *end = nullptr;
+		*out = (uint32_t)strtoul(s, &end, 0);
+		return (end && *end == '\0');
+	}
+	*out = defaultValue;
+	return false;
 }
 
 static void WriteHexU32(JsonWriter &j, const std::string &name, uint32_t value) {
@@ -241,7 +267,9 @@ static std::string HandleReadMemory(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	int size = args.getInt("size", 0);
 	if (size <= 0 || size > 65536)
 		return ToolResultText("size must be between 1 and 65536.", true);
@@ -280,7 +308,9 @@ static std::string HandleWriteMemory(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	std::string hex;
 	if (!args.getString("hex", &hex) || hex.empty())
 		return ToolResultText("Missing or empty 'hex' parameter.", true);
@@ -368,7 +398,9 @@ static std::string HandleDisassemble(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete || !currentDebugMIPS)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	int count = args.getInt("count", 16);
 	if (count <= 0) count = 16;
 	if (count > 256) count = 256;
@@ -401,7 +433,9 @@ static std::string HandleAssemble(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	std::string instruction;
 	if (!args.getString("instruction", &instruction))
 		return ToolResultText("Missing 'instruction' parameter.", true);
@@ -439,8 +473,9 @@ static std::string HandleSearchMemory(const JsonGet &args) {
 		pattern[i] = (uint8_t)byte;
 	}
 
-	uint32_t start = (uint32_t)args.getInt("start", 0x08800000);
-	uint32_t end = (uint32_t)args.getInt("end", 0x0A000000);
+	uint32_t start, end;
+	ParseAddress(args, "start", &start, 0x08800000);
+	ParseAddress(args, "end", &end, 0x0A000000);
 	int maxResults = args.getInt("max_results", 16);
 	if (maxResults > 256) maxResults = 256;
 
@@ -546,7 +581,9 @@ static std::string HandleSetBreakpoint(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	bool enabled = args.getBool("enabled", true);
 
 	g_breakpoints.AddBreakPoint(addr, false);
@@ -563,7 +600,9 @@ static std::string HandleRemoveBreakpoint(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
 
-	uint32_t addr = (uint32_t)args.getInt("address", 0);
+	uint32_t addr;
+	if (!ParseAddress(args, "address", &addr))
+		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	g_breakpoints.RemoveBreakPoint(addr);
 
 	char msg[128];
@@ -603,7 +642,9 @@ static std::string HandleLookupSymbol(const JsonGet &args) {
 		return ToolResultText("Provide either 'address' or 'name'.", true);
 
 	if (hasAddr) {
-		uint32_t addr = (uint32_t)args.getInt("address", 0);
+		uint32_t addr;
+		if (!ParseAddress(args, "address", &addr))
+			return ToolResultText("Invalid 'address' parameter.", true);
 		const std::string label = g_symbolMap->GetLabelString(addr);
 		const std::string desc = g_symbolMap->GetDescription(addr);
 
