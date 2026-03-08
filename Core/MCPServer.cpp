@@ -1687,7 +1687,7 @@ bool StartMCPServer(int port) {
 	if (core == CPUCore::JIT || core == CPUCore::JIT_IR) {
 		g_OSD.Show(OSDType::MESSAGE_ERROR,
 			"MCP server requires interpreter mode",
-			"Change CPU core to Interpreter or IR Interpreter in Developer Tools settings.",
+			"Change CPU core to Interpreter in Developer Tools settings.",
 			5.0f);
 		return false;
 	}

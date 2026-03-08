@@ -148,6 +148,27 @@ void DeveloperToolsScreen::CreateGeneralTab(UI::LinearLayout *list) {
 	static const char *cpuCores[] = { "Interpreter", "Dynarec/JIT (recommended)", "IR Interpreter", "JIT using IR" };
 	PopupMultiChoice *core = list->Add(new PopupMultiChoice(&g_Config.iCpuCore, sy->T("CPU Core"), cpuCores, 0, ARRAY_SIZE(cpuCores), I18NCat::SYSTEM, screenManager()));
 	core->OnChoice.Add([=](UI::EventParams &e) {
+		CPUCore newCore = (CPUCore)g_Config.iCpuCore;
+		if (MCPServerRunning() && newCore != CPUCore::INTERPRETER) {
+			auto di = GetI18NCategory(I18NCat::DIALOG);
+			auto dev = GetI18NCategory(I18NCat::DEVELOPER);
+			screenManager()->push(new UI::MessagePopupScreen(
+				dev->T("MCP Server"),
+				dev->T("MCPWillDisable", "The MCP server requires interpreter mode and will be disabled.\nContinue?"),
+				di->T("Yes"), di->T("No"),
+				[this](bool yes) {
+					if (yes) {
+						ShutdownMCPServer();
+						enableMCPServer_ = false;
+						g_Config.bEnableMCPServer = false;
+					} else {
+						g_Config.iCpuCore = (int)CPUCore::INTERPRETER;
+					}
+					System_PostUIMessage(UIMessage::REQUEST_CLEAR_JIT);
+					g_Config.NotifyUpdatedCpuCore();
+				}));
+			return;
+		}
 		OnJitAffectingSetting(e);
 		g_Config.NotifyUpdatedCpuCore();
 	});
@@ -758,12 +779,13 @@ void DeveloperToolsScreen::OnMCPServer(UI::EventParams &e) {
 			auto dev = GetI18NCategory(I18NCat::DEVELOPER);
 			screenManager()->push(new UI::MessagePopupScreen(
 				dev->T("MCP Server"),
-				dev->T("MCPRequiresInterpreter", "The MCP server requires the CPU to run in interpreter mode.\nSwitch to IR Interpreter now?"),
+				dev->T("MCPRequiresInterpreter", "The MCP server requires the CPU to run in interpreter mode.\nSwitch to Interpreter now?"),
 				di->T("Yes"), di->T("No"),
 				[this](bool yes) {
 					if (yes) {
-						g_Config.iCpuCore = (int)CPUCore::IR_INTERPRETER;
+						g_Config.iCpuCore = (int)CPUCore::INTERPRETER;
 						g_Config.NotifyUpdatedCpuCore();
+						System_PostUIMessage(UIMessage::REQUEST_CLEAR_JIT);
 						StartMCPServer(g_Config.iMCPServerPort);
 						g_Config.bEnableMCPServer = true;
 					} else {
