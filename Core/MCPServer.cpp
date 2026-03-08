@@ -1683,6 +1683,15 @@ bool StartMCPServer(int port) {
 	if (mcpRunning)
 		return false;
 
+	CPUCore core = (CPUCore)g_Config.iCpuCore;
+	if (core == CPUCore::JIT || core == CPUCore::JIT_IR) {
+		g_OSD.Show(OSDType::MESSAGE_ERROR,
+			"MCP server requires interpreter mode",
+			"Change CPU core to Interpreter or IR Interpreter in Developer Tools settings.",
+			5.0f);
+		return false;
+	}
+
 	mcpRunning = true;
 	mcpThread = std::thread(&MCPServerThread, port);
 	return true;

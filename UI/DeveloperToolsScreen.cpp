@@ -752,6 +752,27 @@ void DeveloperToolsScreen::OnRemoteDebugger(UI::EventParams &e) {
 #if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
 void DeveloperToolsScreen::OnMCPServer(UI::EventParams &e) {
 	if (enableMCPServer_) {
+		CPUCore core = (CPUCore)g_Config.iCpuCore;
+		if (core == CPUCore::JIT || core == CPUCore::JIT_IR) {
+			auto di = GetI18NCategory(I18NCat::DIALOG);
+			auto dev = GetI18NCategory(I18NCat::DEVELOPER);
+			screenManager()->push(new UI::MessagePopupScreen(
+				dev->T("MCP Server"),
+				dev->T("MCPRequiresInterpreter", "The MCP server requires the CPU to run in interpreter mode.\nSwitch to IR Interpreter now?"),
+				di->T("Yes"), di->T("No"),
+				[this](bool yes) {
+					if (yes) {
+						g_Config.iCpuCore = (int)CPUCore::IR_INTERPRETER;
+						g_Config.NotifyUpdatedCpuCore();
+						StartMCPServer(g_Config.iMCPServerPort);
+						g_Config.bEnableMCPServer = true;
+					} else {
+						enableMCPServer_ = false;
+						g_Config.bEnableMCPServer = false;
+					}
+				}));
+			return;
+		}
 		StartMCPServer(g_Config.iMCPServerPort);
 	} else {
 		ShutdownMCPServer();
