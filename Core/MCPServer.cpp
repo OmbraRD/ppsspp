@@ -57,6 +57,9 @@
 #include "GPU/Common/GPUDebugInterface.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
 #include "GPU/Debugger/Stepping.h"
+#include "GPU/Debugger/Breakpoints.h"
+#include "GPU/Debugger/State.h"
+#include "GPU/Debugger/Debugger.h"
 #include "GPU/GeDisasm.h"
 #include "Core/Util/PathUtil.h"
 #include "Common/File/FileUtil.h"
@@ -210,6 +213,29 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"address", "string", "Start address to disassemble. Hex with 0x prefix or decimal.", true},
 			{"count", "number", "Number of GE commands to disassemble (default 32). Stops early at END command.", false},
 		}},
+		{"get_gpu_state", "Get the current GE (GPU) rendering state. Returns key register values formatted as human-readable strings, organized by category (flags, lighting, texture, settings).", {
+			{"category", "string", "Category to return: 'flags', 'lighting', 'texture', 'settings', or 'all' (default 'all').", false},
+		}},
+		{"get_current_texture", "Dump the currently bound GPU texture as a PNG image. Emulator must be paused.", {
+			{"level", "number", "Mipmap level (default 0).", false},
+		}},
+		{"get_depth_buffer", "Dump the current depth buffer as a PNG image. Emulator must be paused.", {}},
+		{"get_stencil_buffer", "Dump the current stencil buffer as a PNG image. Emulator must be paused.", {}},
+		{"get_current_clut", "Dump the current CLUT (Color Lookup Table / palette) as a PNG image. Emulator must be paused.", {}},
+		{"set_ge_breakpoint", "Set a GE (GPU) breakpoint. Can break on display list address, GE command type, texture address, or render target address.", {
+			{"type", "string", "Breakpoint type: 'address' (display list PC), 'cmd' (GE command byte), 'texture' (texture address), or 'rendertarget' (render target address).", true},
+			{"value", "string", "The value for the breakpoint: address (hex with 0x prefix or decimal) for address/texture/rendertarget, or command number 0-255 for cmd.", true},
+			{"condition", "string", "Expression that must be true for the breakpoint to trigger (address and cmd types only).", false},
+		}},
+		{"remove_ge_breakpoint", "Remove a GE (GPU) breakpoint.", {
+			{"type", "string", "Breakpoint type: 'address', 'cmd', 'texture', or 'rendertarget'.", true},
+			{"value", "string", "The value of the breakpoint to remove.", true},
+		}},
+		{"set_ge_break_on", "Set the GE debugger to break on the next occurrence of a specific event. Emulator must be running.", {
+			{"event", "string", "Event to break on: 'op' (next GE command), 'draw' (next draw call), 'tex' (texture command), 'nontex' (non-texture command), 'frame' (frame boundary), 'vsync', 'prim' (primitive draw), 'curve' (bezier/spline), 'blocktransfer'.", true},
+			{"count", "number", "Number of events to skip before breaking (default 1).", false},
+		}},
+		{"get_gpu_stats", "Get GPU rendering statistics for the current/last frame.", {}},
 	};
 }
 
@@ -1110,6 +1136,317 @@ static std::string HandleGEDisassemble(const JsonGet &args) {
 	return ToolResultText(result);
 }
 
+static std::string GPUDebugBufferToPNG(const GPUDebugBuffer &buffer) {
+	u8 *flipbuffer = nullptr;
+	u32 w = buffer.GetStride();
+	u32 h = buffer.GetHeight();
+	const u8 *rgb = ConvertBufferToScreenshot(buffer, false, flipbuffer, w, h);
+	if (!rgb) {
+		delete[] flipbuffer;
+		return ToolResultText("Failed to convert buffer data.", true);
+	}
+
+	Path screenshotDir = GetSysDirectory(DIRECTORY_SCREENSHOT);
+	File::CreateDir(screenshotDir);
+	Path tempPath = screenshotDir / ".mcp_gpubuffer.png";
+
+	bool saved = Save888RGBScreenshot(tempPath, ScreenshotFormat::PNG, rgb, w, h);
+	delete[] flipbuffer;
+	if (!saved)
+		return ToolResultText("Failed to save buffer as PNG.", true);
+
+	size_t fileSize;
+	uint8_t *fileData = File::ReadLocalFile(tempPath, &fileSize);
+	if (!fileData || fileSize == 0)
+		return ToolResultText("Failed to read buffer PNG.", true);
+
+	std::string base64 = Base64Encode(fileData, fileSize);
+	delete[] fileData;
+	File::Delete(tempPath);
+
+	return ToolResultImage(base64, "image/png");
+}
+
+static std::string HandleGetGPUState(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	std::string category;
+	args.getString("category", &category);
+	if (category.empty()) category = "all";
+
+	struct CategoryInfo {
+		const char *name;
+		const GECommand *rows;
+		size_t count;
+	};
+
+	CategoryInfo categories[] = {
+		{"flags", g_stateFlagsRows, g_stateFlagsRowsSize},
+		{"lighting", g_stateLightingRows, g_stateLightingRowsSize},
+		{"texture", g_stateTextureRows, g_stateTextureRowsSize},
+		{"settings", g_stateSettingsRows, g_stateSettingsRowsSize},
+	};
+
+	const GPUgstate &gstate = gpuDebug->GetGState();
+
+	JsonWriter j;
+	j.begin();
+
+	for (auto &cat : categories) {
+		if (category != "all" && category != cat.name)
+			continue;
+
+		j.pushDict(cat.name);
+		for (size_t i = 0; i < cat.count; i++) {
+			GECommand cmd = cat.rows[i];
+			const GECmdInfo &info = GECmdInfoByCmd(cmd);
+			u32 value = gstate.cmdmem[cmd];
+			u32 otherValue = info.otherCmd ? gstate.cmdmem[info.otherCmd] : 0;
+			u32 otherValue2 = info.otherCmd2 ? gstate.cmdmem[info.otherCmd2] : 0;
+			bool enabled = info.enableCmd == 0 || (gstate.cmdmem[info.enableCmd] & 0x01) != 0;
+
+			char formatted[256];
+			FormatStateRow(gpuDebug, formatted, sizeof(formatted), info.fmt, value, enabled, otherValue, otherValue2);
+			j.writeString(info.name, formatted);
+		}
+		j.pop();
+	}
+
+	j.end();
+	return ToolResultText(j.str());
+}
+
+static std::string HandleGetCurrentTexture(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	int level = args.getInt("level", 0);
+	if (level < 0 || level > 7)
+		return ToolResultText("Mipmap level must be 0-7.", true);
+
+	const GPUDebugBuffer *buffer = nullptr;
+	bool isFramebuffer = false;
+	if (!GPUStepping::GPU_GetCurrentTexture(buffer, level, &isFramebuffer) || !buffer)
+		return ToolResultText("Failed to get current texture. Make sure a draw call is in progress.", true);
+
+	return GPUDebugBufferToPNG(*buffer);
+}
+
+static std::string HandleGetDepthBuffer(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	const GPUDebugBuffer *buffer = nullptr;
+	if (!GPUStepping::GPU_GetCurrentDepthbuffer(buffer) || !buffer)
+		return ToolResultText("Failed to get depth buffer.", true);
+
+	return GPUDebugBufferToPNG(*buffer);
+}
+
+static std::string HandleGetStencilBuffer(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	const GPUDebugBuffer *buffer = nullptr;
+	if (!GPUStepping::GPU_GetCurrentStencilbuffer(buffer) || !buffer)
+		return ToolResultText("Failed to get stencil buffer.", true);
+
+	return GPUDebugBufferToPNG(*buffer);
+}
+
+static std::string HandleGetCurrentClut(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
+		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
+
+	const GPUDebugBuffer *buffer = nullptr;
+	if (!GPUStepping::GPU_GetCurrentClut(buffer) || !buffer)
+		return ToolResultText("Failed to get CLUT.", true);
+
+	return GPUDebugBufferToPNG(*buffer);
+}
+
+static std::string HandleSetGEBreakpoint(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	std::string type;
+	if (!args.getString("type", &type) || type.empty())
+		return ToolResultText("Missing 'type' parameter.", true);
+
+	GPUBreakpoints *bp = gpuDebug->GetBreakpoints();
+	if (!bp)
+		return ToolResultText("GPU breakpoints not available.", true);
+
+	if (type == "address") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->AddAddressBreakpoint(addr);
+
+		std::string condition;
+		if (args.getString("condition", &condition) && !condition.empty()) {
+			std::string error;
+			if (!bp->SetAddressBreakpointCond(addr, condition, &error))
+				return ToolResultText("GE breakpoint set but condition failed: " + error, true);
+		}
+
+		char msg[256];
+		snprintf(msg, sizeof(msg), "GE address breakpoint set at 0x%08X.", addr);
+		return ToolResultText(msg);
+	} else if (type == "cmd") {
+		uint32_t cmd;
+		if (!ParseAddress(args, "value", &cmd))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		if (cmd > 255)
+			return ToolResultText("GE command must be 0-255.", true);
+		bp->AddCmdBreakpoint((u8)cmd);
+
+		std::string condition;
+		if (args.getString("condition", &condition) && !condition.empty()) {
+			std::string error;
+			if (!bp->SetCmdBreakpointCond((u8)cmd, condition, &error))
+				return ToolResultText("GE breakpoint set but condition failed: " + error, true);
+		}
+
+		const GECmdInfo &info = GECmdInfoByCmd((GECommand)cmd);
+		char msg[256];
+		snprintf(msg, sizeof(msg), "GE command breakpoint set on cmd %d (%s).", cmd, info.name);
+		return ToolResultText(msg);
+	} else if (type == "texture") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->AddTextureBreakpoint(addr);
+
+		char msg[256];
+		snprintf(msg, sizeof(msg), "GE texture breakpoint set at 0x%08X.", addr);
+		return ToolResultText(msg);
+	} else if (type == "rendertarget") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->AddRenderTargetBreakpoint(addr);
+
+		char msg[256];
+		snprintf(msg, sizeof(msg), "GE render target breakpoint set at 0x%08X.", addr);
+		return ToolResultText(msg);
+	}
+
+	return ToolResultText("Invalid type. Use 'address', 'cmd', 'texture', or 'rendertarget'.", true);
+}
+
+static std::string HandleRemoveGEBreakpoint(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	std::string type;
+	if (!args.getString("type", &type) || type.empty())
+		return ToolResultText("Missing 'type' parameter.", true);
+
+	GPUBreakpoints *bp = gpuDebug->GetBreakpoints();
+	if (!bp)
+		return ToolResultText("GPU breakpoints not available.", true);
+
+	if (type == "address") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->RemoveAddressBreakpoint(addr);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "GE address breakpoint removed at 0x%08X.", addr);
+		return ToolResultText(msg);
+	} else if (type == "cmd") {
+		uint32_t cmd;
+		if (!ParseAddress(args, "value", &cmd))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		if (cmd > 255)
+			return ToolResultText("GE command must be 0-255.", true);
+		bp->RemoveCmdBreakpoint((u8)cmd);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "GE command breakpoint removed for cmd %d.", cmd);
+		return ToolResultText(msg);
+	} else if (type == "texture") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->RemoveTextureBreakpoint(addr);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "GE texture breakpoint removed at 0x%08X.", addr);
+		return ToolResultText(msg);
+	} else if (type == "rendertarget") {
+		uint32_t addr;
+		if (!ParseAddress(args, "value", &addr))
+			return ToolResultText("Missing or invalid 'value' parameter.", true);
+		bp->RemoveRenderTargetBreakpoint(addr);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "GE render target breakpoint removed at 0x%08X.", addr);
+		return ToolResultText(msg);
+	}
+
+	return ToolResultText("Invalid type. Use 'address', 'cmd', 'texture', or 'rendertarget'.", true);
+}
+
+static std::string HandleSetGEBreakOn(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	std::string event;
+	if (!args.getString("event", &event) || event.empty())
+		return ToolResultText("Missing 'event' parameter.", true);
+
+	int count = args.getInt("count", 1);
+	if (count < 1) count = 1;
+
+	GPUDebug::BreakNext breakNext;
+	if (event == "op") breakNext = GPUDebug::BreakNext::OP;
+	else if (event == "draw") breakNext = GPUDebug::BreakNext::DRAW;
+	else if (event == "tex") breakNext = GPUDebug::BreakNext::TEX;
+	else if (event == "nontex") breakNext = GPUDebug::BreakNext::NONTEX;
+	else if (event == "frame") breakNext = GPUDebug::BreakNext::FRAME;
+	else if (event == "vsync") breakNext = GPUDebug::BreakNext::VSYNC;
+	else if (event == "prim") breakNext = GPUDebug::BreakNext::PRIM;
+	else if (event == "curve") breakNext = GPUDebug::BreakNext::CURVE;
+	else if (event == "blocktransfer") breakNext = GPUDebug::BreakNext::BLOCK_TRANSFER;
+	else
+		return ToolResultText("Invalid event. Use: op, draw, tex, nontex, frame, vsync, prim, curve, blocktransfer.", true);
+
+	gpuDebug->SetBreakNext(breakNext);
+	gpuDebug->SetBreakCount(count);
+
+	char msg[128];
+	snprintf(msg, sizeof(msg), "GE will break on next '%s' event (count=%d).", event.c_str(), count);
+	return ToolResultText(msg);
+}
+
+static std::string HandleGetGPUStats(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+		return ToolResultText("No game loaded.", true);
+
+	char stats[4096];
+	gpuDebug->GetStats(stats, sizeof(stats));
+
+	JsonWriter j;
+	j.begin();
+	j.writeString("stats", stats);
+	j.writeInt("prims_this_frame", gpuDebug->PrimsThisFrame());
+	j.writeInt("prims_last_frame", gpuDebug->PrimsLastFrame());
+	j.end();
+	return ToolResultText(j.str());
+}
+
 typedef std::string (*ToolHandler)(const JsonGet &args);
 static std::map<std::string, ToolHandler> &GetToolHandlers() {
 	static std::map<std::string, ToolHandler> handlers = {
@@ -1138,6 +1475,15 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"list_hle_modules", HandleListHLEModules},
 		{"ge_list_display_lists", HandleGEListDisplayLists},
 		{"ge_disassemble", HandleGEDisassemble},
+		{"get_gpu_state", HandleGetGPUState},
+		{"get_current_texture", HandleGetCurrentTexture},
+		{"get_depth_buffer", HandleGetDepthBuffer},
+		{"get_stencil_buffer", HandleGetStencilBuffer},
+		{"get_current_clut", HandleGetCurrentClut},
+		{"set_ge_breakpoint", HandleSetGEBreakpoint},
+		{"remove_ge_breakpoint", HandleRemoveGEBreakpoint},
+		{"set_ge_break_on", HandleSetGEBreakOn},
+		{"get_gpu_stats", HandleGetGPUStats},
 	};
 	return handlers;
 }
