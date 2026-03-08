@@ -41,13 +41,17 @@
 #include "Core/System.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPSAsm.h"
+#include "Core/MIPS/MIPSCodeUtils.h"
 #include "Core/MIPS/MIPSDebugInterface.h"
 #include "Core/MIPS/MIPSTables.h"
 #include "Core/Debugger/Breakpoints.h"
 #include "Core/Debugger/DisassemblyManager.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/ELF/ParamSFO.h"
+#include "Core/HLE/sceKernel.h"
+#include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelThread.h"
+#include "Core/HLE/HLE.h"
 #include "Core/Screenshot.h"
 #include "GPU/GPU.h"
 #include "GPU/Common/GPUDebugInterface.h"
@@ -145,9 +149,10 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"register", "string", "Register name (r0-r31, or named: zero,at,v0-v1,a0-a3,t0-t9,s0-s7,k0-k1,gp,sp,fp,ra,hi,lo,pc).", true},
 			{"value", "number", "Value to write.", true},
 		}},
-		{"disassemble", "Disassemble MIPS instructions at a given address.", {
+		{"disassemble", "Disassemble MIPS instructions at a given address. Stops at jr ra (function return) by default.", {
 			{"address", "string", "Start address to disassemble. Hex with 0x prefix or decimal.", true},
-			{"count", "number", "Number of instructions to disassemble (default 16, max 256).", false},
+			{"count", "number", "Maximum number of instructions to disassemble (default 16).", false},
+			{"stop", "string", "Stop behavior: 'return' (default, stop at jr ra) or 'none' (disassemble exactly count instructions).", false},
 		}},
 		{"assemble", "Assemble a single MIPS instruction and write it to memory.", {
 			{"address", "string", "Address to write the assembled instruction. Hex with 0x prefix or decimal.", true},
@@ -179,10 +184,11 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		{"take_screenshot", "Capture a screenshot of the current PSP display as a PNG image.", {
 			{"type", "string", "Screenshot type: 'display' (default, game output) or 'render' (in-progress render).", false},
 		}},
+		{"list_hle_modules", "List HLE modules and functions imported by the running game.", {}},
 		{"ge_list_display_lists", "List active GE (GPU) display lists with their status, PC, and stall address.", {}},
 		{"ge_disassemble", "Disassemble GE (GPU) display list commands at a given address. Returns human-readable GPU command descriptions.", {
 			{"address", "string", "Start address to disassemble. Hex with 0x prefix or decimal.", true},
-			{"count", "number", "Number of GE commands to disassemble (default 32, max 256).", false},
+			{"count", "number", "Number of GE commands to disassemble (default 32). Stops early at END command.", false},
 		}},
 	};
 }
@@ -412,7 +418,12 @@ static std::string HandleDisassemble(const JsonGet &args) {
 		return ToolResultText("Missing or invalid 'address' parameter.", true);
 	int count = args.getInt("count", 16);
 	if (count <= 0) count = 16;
-	if (count > 256) count = 256;
+
+	bool stopAtRet = true;
+	std::string stopStr;
+	if (args.getString("stop", &stopStr) && stopStr == "none")
+		stopAtRet = false;
+	int delaySlotCount = 0;
 
 	std::string result;
 	for (int i = 0; i < count; i++) {
@@ -433,6 +444,14 @@ static std::string HandleDisassemble(const JsonGet &args) {
 		}
 		result += line;
 		result += "\n";
+
+		if (!stopAtRet)
+			continue;
+		// Stop after jr ra + its delay slot.
+		if (delaySlotCount > 0)
+			break;
+		if (opcode == MIPS_MAKE_JR_RA())
+			delaySlotCount = 1;
 	}
 
 	return ToolResultText(result);
@@ -703,7 +722,9 @@ static std::string HandleLookupSymbol(const JsonGet &args) {
 	std::string name;
 	args.getString("name", &name);
 	u32 addr;
-	if (g_symbolMap->GetLabelValue(name.c_str(), addr)) {
+	// Try exact match first, then with zz_ prefix (HLE imports are stored as zz_funcName).
+	if (g_symbolMap->GetLabelValue(name.c_str(), addr) ||
+		g_symbolMap->GetLabelValue(("zz_" + name).c_str(), addr)) {
 		JsonWriter j;
 		j.begin();
 		j.writeString("name", name);
@@ -785,6 +806,51 @@ static const char *DisplayListStateToString(DisplayListState state) {
 	}
 }
 
+static std::string HandleListHLEModules(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+
+	JsonWriter j;
+	j.begin();
+	j.pushArray("modules");
+
+	kernelObjects.Iterate<PSPModule>([&](SceUID uid, PSPModule *mod) -> bool {
+		if (mod->importedFuncs.empty() && mod->exportedFuncs.empty())
+			return true;  // Skip modules with no imports/exports.
+
+		j.pushDict();
+		j.writeString("name", mod->GetName());
+		j.writeInt("uid", uid);
+		WriteHexU32(j, "text_addr", mod->nm.text_addr);
+		j.writeInt("text_size", mod->nm.text_size);
+
+		if (!mod->impModuleNames.empty()) {
+			j.pushDict("imports");
+			for (const auto &modName : mod->impModuleNames) {
+				j.pushArray(modName.c_str());
+				for (const auto &func : mod->importedFuncs) {
+					if (func.moduleName == modName) {
+						const char *name = GetHLEFuncName(func.moduleName, func.nid);
+						j.pushDict();
+						j.writeString("name", name ? name : "(unknown)");
+						WriteHexU32(j, "nid", func.nid);
+						WriteHexU32(j, "stub_addr", func.stubAddr);
+						j.pop();
+					}
+				}
+				j.pop();
+			}
+			j.pop();
+		}
+		j.pop();
+		return true;
+	});
+
+	j.pop();
+	j.end();
+	return ToolResultText(j.str());
+}
+
 static std::string HandleGEListDisplayLists(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
 		return ToolResultText("No game loaded.", true);
@@ -821,7 +887,6 @@ static std::string HandleGEDisassemble(const JsonGet &args) {
 
 	int count = args.getInt("count", 32);
 	if (count <= 0) count = 32;
-	if (count > 256) count = 256;
 
 	if (!Memory::IsValidAddress(addr))
 		return ToolResultText("Invalid memory address.", true);
@@ -865,6 +930,7 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"list_breakpoints", HandleListBreakpoints},
 		{"lookup_symbol", HandleLookupSymbol},
 		{"take_screenshot", HandleTakeScreenshot},
+		{"list_hle_modules", HandleListHLEModules},
 		{"ge_list_display_lists", HandleGEListDisplayLists},
 		{"ge_disassemble", HandleGEDisassemble},
 	};
