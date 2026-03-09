@@ -54,6 +54,7 @@
 #include "Core/HLE/HLE.h"
 #include "Core/Screenshot.h"
 #include "GPU/GPU.h"
+#include "GPU/GPUState.h"
 #include "GPU/Common/GPUDebugInterface.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
 #include "GPU/Debugger/Stepping.h"
@@ -1143,12 +1144,11 @@ static std::string HandleGEDisassemble(const JsonGet &args) {
 static u8 *ConvertDepthStencilToRGB(const GPUDebugBuffer &buffer, u32 w, u32 h) {
 	u8 *rgb = new u8[w * h * 3];
 	GPUDebugBufferFormat fmt = buffer.GetFormat();
-	bool flipped = buffer.GetFlipped();
 
 	for (u32 y = 0; y < h; y++) {
-		u32 srcY = flipped ? (h - 1 - y) : y;
 		for (u32 x = 0; x < w; x++) {
-			u32 raw = buffer.GetRawPixel(x, srcY);
+			// GetRawPixel handles flipping internally.
+			u32 raw = buffer.GetRawPixel(x, y);
 			u8 val;
 			switch (fmt) {
 			case GPU_DBG_FORMAT_FLOAT:
@@ -1285,12 +1285,12 @@ static std::string HandleGetCurrentTexture(const JsonGet &args) {
 	if (level < 0 || level > 7)
 		return ToolResultText("Mipmap level must be 0-7.", true);
 
-	const GPUDebugBuffer *buffer = nullptr;
+	GPUDebugBuffer buffer;
 	bool isFramebuffer = false;
-	if (!GPUStepping::GPU_GetCurrentTexture(buffer, level, &isFramebuffer) || !buffer)
+	if (!gpuDebug->GetCurrentTexture(buffer, level, &isFramebuffer))
 		return ToolResultText("Failed to get current texture. Make sure a draw call is in progress.", true);
 
-	return GPUDebugBufferToPNG(*buffer);
+	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleGetDepthBuffer(const JsonGet &args) {
@@ -1300,11 +1300,20 @@ static std::string HandleGetDepthBuffer(const JsonGet &args) {
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	const GPUDebugBuffer *buffer = nullptr;
-	if (!GPUStepping::GPU_GetCurrentDepthbuffer(buffer) || !buffer)
+	auto *fbManager = gpuDebug->GetFramebufferManagerCommon();
+	if (!fbManager)
+		return ToolResultText("Framebuffer manager not available.", true);
+
+	u32 fb_address = gstate.getFrameBufRawAddress() | 0x04000000;
+	int fb_stride = gstate.FrameBufStride();
+	u32 z_address = gstate.getDepthBufRawAddress() | 0x04000000;
+	int z_stride = gstate.DepthBufStride();
+
+	GPUDebugBuffer buffer;
+	if (!fbManager->GetDepthbuffer(fb_address, fb_stride, z_address, z_stride, buffer))
 		return ToolResultText("Failed to get depth buffer.", true);
 
-	return GPUDebugBufferToPNG(*buffer);
+	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleGetStencilBuffer(const JsonGet &args) {
@@ -1314,11 +1323,18 @@ static std::string HandleGetStencilBuffer(const JsonGet &args) {
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	const GPUDebugBuffer *buffer = nullptr;
-	if (!GPUStepping::GPU_GetCurrentStencilbuffer(buffer) || !buffer)
+	auto *fbManager = gpuDebug->GetFramebufferManagerCommon();
+	if (!fbManager)
+		return ToolResultText("Framebuffer manager not available.", true);
+
+	u32 fb_address = gstate.getFrameBufRawAddress() | 0x04000000;
+	int fb_stride = gstate.FrameBufStride();
+
+	GPUDebugBuffer buffer;
+	if (!fbManager->GetStencilbuffer(fb_address, fb_stride, buffer))
 		return ToolResultText("Failed to get stencil buffer.", true);
 
-	return GPUDebugBufferToPNG(*buffer);
+	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleGetCurrentClut(const JsonGet &args) {
@@ -1328,11 +1344,11 @@ static std::string HandleGetCurrentClut(const JsonGet &args) {
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	const GPUDebugBuffer *buffer = nullptr;
-	if (!GPUStepping::GPU_GetCurrentClut(buffer) || !buffer)
+	GPUDebugBuffer buffer;
+	if (!gpuDebug->GetCurrentClut(buffer))
 		return ToolResultText("Failed to get CLUT.", true);
 
-	return GPUDebugBufferToPNG(*buffer);
+	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleSetGEBreakpoint(const JsonGet &args) {
