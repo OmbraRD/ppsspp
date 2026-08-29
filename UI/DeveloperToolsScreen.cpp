@@ -148,7 +148,10 @@ void DeveloperToolsScreen::CreateGeneralTab(UI::LinearLayout *list) {
 	static const char *cpuCores[] = { "Interpreter", "Dynarec/JIT (recommended)", "IR Interpreter", "JIT using IR" };
 	PopupMultiChoice *core = list->Add(new PopupMultiChoice(&g_Config.iCpuCore, sy->T("CPU Core"), cpuCores, 0, ARRAY_SIZE(cpuCores), I18NCat::SYSTEM, screenManager()));
 	core->OnChoice.Add([=](UI::EventParams &e) {
-		CPUCore newCore = (CPUCore)g_Config.iCpuCore;
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(IOS)
+		// Core/MCPServer.cpp is not in the Android or iOS builds, so these
+		// calls have to be compiled out with the checkbox that creates them.
+		const CPUCore newCore = (CPUCore)g_Config.iCpuCore;
 		if (MCPServerRunning() && newCore != CPUCore::INTERPRETER) {
 			auto di = GetI18NCategory(I18NCat::DIALOG);
 			auto dev = GetI18NCategory(I18NCat::DEVELOPER);
@@ -169,6 +172,7 @@ void DeveloperToolsScreen::CreateGeneralTab(UI::LinearLayout *list) {
 				}));
 			return;
 		}
+#endif
 		OnJitAffectingSetting(e);
 		g_Config.NotifyUpdatedCpuCore();
 	});

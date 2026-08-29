@@ -221,7 +221,7 @@ bool TestMCPServer() {
 		EXPECT_TRUE(resultNode != nullptr);
 		JsonGet result(resultNode->value);
 
-		EXPECT_TRUE(result.getBool("isError", false));
+		EXPECT_TRUE(result.getBoolOr("isError", false));
 
 		printf("  [PASS] tools/call get_game_info (no game = error)\n");
 	}
