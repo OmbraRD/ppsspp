@@ -33,11 +33,20 @@ jobs:
         run: |
           set -eu
           mkdir -p release
-          # Artifact directories are named "Windows x64 build", "macos build", etc.
+          # Artifacts are named "Windows x64 build", "macos-latest build", and so
+          # on. Runner labels are translated to something a person downloading can
+          # act on, and the frametest report is not a build at all.
           for d in artifacts/*/; do
             [ -d "$d" ] || continue
             v=$(basename "$d")
+            case "$v" in
+              frametest-report*) continue ;;
+            esac
             v="${v% build}"
+            v="${v//macos-latest/macOS}"
+            v="${v//ubuntu-26.04/Linux-x64}"
+            v="${v//ubuntu-24.04/Linux-x64}"
+            v="${v//ios/iOS}"
             v=$(printf '%s' "$v" | sed 's/[^A-Za-z0-9._-]\{1,\}/-/g; s/--*/-/g; s/^-//; s/-$//')
             ( cd "$d" && zip -qr "$OLDPWD/release/PPSSPP-MCP-${v}.zip" . )
           done
