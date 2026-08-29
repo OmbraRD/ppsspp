@@ -1,0 +1,61 @@
+# Publishes a rolling release from the mcp branch, out of the artifacts that
+# upstream's "Build" workflow already produces.
+#
+# Deliberately a separate file: the MCP patch set is rebased onto upstream
+# whenever it moves, and every line added to build.yml is a conflict paid at
+# each rebase. Upstream's own release steps stay untouched -- they fire on tags,
+# this one on the branch.
+name: MCP Release
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+jobs:
+  release:
+    name: Publish release
+    if: >-
+      github.event.workflow_run.head_branch == 'mcp' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts from the build run
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: artifacts
+
+      - name: Name the assets
+        run: |
+          set -eu
+          mkdir -p release
+          # Artifact directories are named "Windows x64 build", "macos build", etc.
+          for d in artifacts/*/; do
+            [ -d "$d" ] || continue
+            v=$(basename "$d")
+            v="${v% build}"
+            v=$(printf '%s' "$v" | sed 's/[^A-Za-z0-9._-]\{1,\}/-/g; s/--*/-/g; s/^-//; s/-$//')
+            ( cd "$d" && zip -qr "$OLDPWD/release/PPSSPP-MCP-${v}.zip" . )
+          done
+          ls -la release/
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.event.workflow_run.head_sha }}
+          name: PPSSPP with MCP server
+          body: |
+            PPSSPP built from the `mcp` branch, with the Model Context Protocol
+            debug server included (36 tools, HTTP on port 27077).
+
+            Enable it under **Settings -> Tools -> Developer tools -> Enable MCP server**.
+
+            Built from ${{ github.event.workflow_run.head_sha }}.
+          prerelease: false
+          make_latest: true
+          files: release/*
