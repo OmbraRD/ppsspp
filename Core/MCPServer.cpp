@@ -53,9 +53,11 @@
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/HLE.h"
 #include "Core/Screenshot.h"
+#include "Common/Data/Text/StringWriter.h"
 #include "GPU/GPU.h"
 #include "GPU/GPUState.h"
 #include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/Common/SoftwareTransformCommon.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
 #include "GPU/Debugger/Stepping.h"
 #include "GPU/Debugger/Breakpoints.h"
@@ -481,7 +483,7 @@ static std::string HandleDisassemble(const JsonGet &args) {
 		uint32_t instrAddr = addr + i * 4;
 		if (!Memory::IsValidAddress(instrAddr))
 			break;
-		uint32_t opcode = Memory::Read_U32(instrAddr);
+		uint32_t opcode = Memory::ReadUnchecked_U32(instrAddr);
 		char disasm[256];
 		MIPSDisAsm(MIPSOpcode(opcode), instrAddr, disasm, sizeof(disasm), true);
 
@@ -528,7 +530,7 @@ static std::string HandleAssemble(const JsonGet &args) {
 	}
 
 	char msg[256];
-	uint32_t assembled = Memory::Read_U32(addr);
+	uint32_t assembled = Memory::ReadUnchecked_U32(addr);
 	snprintf(msg, sizeof(msg), "Assembled at 0x%08X: %08X", addr, assembled);
 	return ToolResultText(msg);
 }
@@ -636,7 +638,7 @@ static std::string HandleStepInto(const JsonGet &args) {
 		return ToolResultText("Must be paused to step.", true);
 
 	g_breakpoints.SetSkipFirst(currentMIPS->pc);
-	Core_RequestCPUStep(CPUStepType::Into, 1);
+	Core_RequestCPUStep(CPUStepType::Into);
 
 	int timeout = 100;
 	while (!Core_IsStepping() && timeout > 0) {
@@ -690,9 +692,9 @@ static std::string HandleSetBreakpoint(const JsonGet &args) {
 	uint32_t addr;
 	if (!ParseAddress(args, "address", &addr))
 		return ToolResultText("Missing or invalid 'address' parameter.", true);
-	bool enabled = args.getBool("enabled", true);
+	bool enabled = args.getBoolOr("enabled", true);
 
-	g_breakpoints.AddBreakPoint(addr, false);
+	g_breakpoints.AddBreakPoint(addr);
 	if (!enabled)
 		g_breakpoints.ChangeBreakPoint(addr, false);
 
@@ -741,16 +743,16 @@ static std::string HandleSetMemcheck(const JsonGet &args) {
 		return ToolResultText("size must be positive.", true);
 	uint32_t end = addr + size;
 
-	bool read = args.getBool("read", false);
-	bool write = args.getBool("write", true);
-	bool change = args.getBool("change", false);
-	bool enabled = args.getBool("enabled", true);
+	bool read = args.getBoolOr("read", false);
+	bool write = args.getBoolOr("write", true);
+	bool change = args.getBoolOr("change", false);
+	bool enabled = args.getBoolOr("enabled", true);
 
 	int bits = (read ? MEMCHECK_READ : 0) | (write ? MEMCHECK_WRITE : 0) | (change ? MEMCHECK_WRITE_ONCHANGE : 0);
 	if (bits == 0)
 		return ToolResultText("At least one of read, write, or change must be true.", true);
 
-	BreakAction result = enabled ? BREAK_ACTION_PAUSE : BREAK_ACTION_IGNORE;
+	BreakAction result = enabled ? BREAK_ACTION_PAUSE : BREAK_ACTION_NONE;
 	g_breakpoints.AddMemCheck(addr, end, MemCheckCondition(bits), result);
 
 	std::string condition;
@@ -798,8 +800,6 @@ static std::string HandleListBreakpoints(const JsonGet &args) {
 	j.begin();
 	j.pushArray("breakpoints");
 	for (auto &bp : bps) {
-		if (bp.temporary)
-			continue;
 		j.pushDict();
 		j.writeString("type", "execute");
 		WriteHexU32(j, "address", bp.addr);
@@ -941,10 +941,10 @@ static std::string HandleTakeScreenshot(const JsonGet &args) {
 }
 
 static std::string HandleListFramebuffers(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
-	auto list = gpuDebug->GetFramebufferList();
+	auto list = gpu->GetFramebufferList();
 	if (list.empty())
 		return ToolResultText("No active framebuffers.");
 
@@ -969,7 +969,7 @@ static std::string HandleListFramebuffers(const JsonGet &args) {
 }
 
 static std::string HandleGetFramebuffer(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
@@ -980,7 +980,7 @@ static std::string HandleGetFramebuffer(const JsonGet &args) {
 		return ToolResultText("Missing or invalid 'address' parameter.", true);
 
 	// Find the framebuffer at this address.
-	auto list = gpuDebug->GetFramebufferList();
+	auto list = gpu->GetFramebufferList();
 	const VirtualFramebuffer *target = nullptr;
 	for (const auto *vfb : list) {
 		if (vfb->fb_address == addr) {
@@ -993,7 +993,7 @@ static std::string HandleGetFramebuffer(const JsonGet &args) {
 
 	// Get the framebuffer data via the debug interface.
 	GPUDebugBuffer buffer;
-	if (!gpuDebug->GetFramebufferManagerCommon()->GetFramebuffer(target->fb_address, target->fb_stride, target->fb_format, buffer, 1)) {
+	if (!gpu->GetFramebufferManagerCommon()->GetFramebuffer(target->fb_address, target->fb_stride, target->fb_format, buffer, 1)) {
 		return ToolResultText("Failed to read framebuffer data.", true);
 	}
 
@@ -1084,10 +1084,10 @@ static std::string HandleListHLEModules(const JsonGet &args) {
 }
 
 static std::string HandleGEListDisplayLists(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
-	auto lists = gpuDebug->ActiveDisplayLists();
+	auto lists = gpu->ActiveDisplayLists();
 	if (lists.empty())
 		return ToolResultText("No active display lists.");
 
@@ -1110,7 +1110,7 @@ static std::string HandleGEListDisplayLists(const JsonGet &args) {
 }
 
 static std::string HandleGEDisassemble(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	uint32_t addr;
@@ -1128,8 +1128,8 @@ static std::string HandleGEDisassemble(const JsonGet &args) {
 		uint32_t cmdAddr = addr + i * 4;
 		if (!Memory::IsValidAddress(cmdAddr))
 			break;
-		uint32_t op = Memory::Read_U32(cmdAddr);
-		GPUDebugOp decoded = gpuDebug->DisassembleOp(cmdAddr, op);
+		uint32_t op = Memory::ReadUnchecked_U32(cmdAddr);
+		GPUDebugOp decoded = gpu->DisassembleOp(cmdAddr, op);
 		char line[512];
 		snprintf(line, sizeof(line), "0x%08X: [%08X] %s\n", cmdAddr, op, decoded.desc.c_str());
 		result += line;
@@ -1152,16 +1152,13 @@ static u8 *ConvertDepthStencilToRGB(const GPUDebugBuffer &buffer, u32 w, u32 h) 
 			u8 val;
 			switch (fmt) {
 			case GPU_DBG_FORMAT_FLOAT:
-			case GPU_DBG_FORMAT_FLOAT_DIV_256: {
+			{
 				float f;
 				memcpy(&f, &raw, sizeof(float));
-				if (fmt == GPU_DBG_FORMAT_FLOAT_DIV_256)
-					f /= 256.0f;
 				val = (u8)(std::min(std::max(f, 0.0f), 1.0f) * 255.0f);
 				break;
 			}
 			case GPU_DBG_FORMAT_24BIT_8X:
-			case GPU_DBG_FORMAT_24BIT_8X_DIV_256:
 				val = (u8)((raw >> 16) & 0xFF);
 				break;
 			case GPU_DBG_FORMAT_24X_8BIT:
@@ -1225,7 +1222,7 @@ static std::string GPUDebugBufferToPNG(const GPUDebugBuffer &buffer) {
 }
 
 static std::string HandleGetGPUState(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	std::string category;
@@ -1245,7 +1242,7 @@ static std::string HandleGetGPUState(const JsonGet &args) {
 		{"settings", g_stateSettingsRows, g_stateSettingsRowsSize},
 	};
 
-	const GPUgstate &gstate = gpuDebug->GetGState();
+	const GEState &gstate = gpu->GetGState();
 
 	JsonWriter j;
 	j.begin();
@@ -1264,7 +1261,7 @@ static std::string HandleGetGPUState(const JsonGet &args) {
 			bool enabled = info.enableCmd == 0 || (gstate.cmdmem[info.enableCmd] & 0x01) != 0;
 
 			char formatted[256];
-			FormatStateRow(gpuDebug, formatted, sizeof(formatted), info.fmt, value, enabled, otherValue, otherValue2);
+			FormatStateRow(formatted, sizeof(formatted), info.fmt, value, enabled, otherValue, otherValue2);
 			j.writeString(info.name, formatted);
 		}
 		j.pop();
@@ -1275,7 +1272,7 @@ static std::string HandleGetGPUState(const JsonGet &args) {
 }
 
 static std::string HandleGetCurrentTexture(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
@@ -1287,20 +1284,20 @@ static std::string HandleGetCurrentTexture(const JsonGet &args) {
 
 	GPUDebugBuffer buffer;
 	bool isFramebuffer = false;
-	if (!gpuDebug->GetCurrentTexture(buffer, level, &isFramebuffer))
+	if (!gpu->GetCurrentTexture(buffer, level, &isFramebuffer))
 		return ToolResultText("Failed to get current texture. Make sure a draw call is in progress.", true);
 
 	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleGetDepthBuffer(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	auto *fbManager = gpuDebug->GetFramebufferManagerCommon();
+	auto *fbManager = gpu->GetFramebufferManagerCommon();
 	if (!fbManager)
 		return ToolResultText("Framebuffer manager not available.", true);
 
@@ -1317,13 +1314,13 @@ static std::string HandleGetDepthBuffer(const JsonGet &args) {
 }
 
 static std::string HandleGetStencilBuffer(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	auto *fbManager = gpuDebug->GetFramebufferManagerCommon();
+	auto *fbManager = gpu->GetFramebufferManagerCommon();
 	if (!fbManager)
 		return ToolResultText("Framebuffer manager not available.", true);
 
@@ -1338,28 +1335,28 @@ static std::string HandleGetStencilBuffer(const JsonGet &args) {
 }
 
 static std::string HandleGetCurrentClut(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
 	GPUDebugBuffer buffer;
-	if (!gpuDebug->GetCurrentClut(buffer))
+	if (!gpu->GetCurrentClut(buffer))
 		return ToolResultText("Failed to get CLUT.", true);
 
 	return GPUDebugBufferToPNG(buffer);
 }
 
 static std::string HandleSetGEBreakpoint(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	std::string type;
 	if (!args.getString("type", &type) || type.empty())
 		return ToolResultText("Missing 'type' parameter.", true);
 
-	GPUBreakpoints *bp = gpuDebug->GetBreakpoints();
+	GPUBreakpoints *bp = gpu->GetBreakpoints();
 	if (!bp)
 		return ToolResultText("GPU breakpoints not available.", true);
 
@@ -1422,14 +1419,14 @@ static std::string HandleSetGEBreakpoint(const JsonGet &args) {
 }
 
 static std::string HandleRemoveGEBreakpoint(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	std::string type;
 	if (!args.getString("type", &type) || type.empty())
 		return ToolResultText("Missing 'type' parameter.", true);
 
-	GPUBreakpoints *bp = gpuDebug->GetBreakpoints();
+	GPUBreakpoints *bp = gpu->GetBreakpoints();
 	if (!bp)
 		return ToolResultText("GPU breakpoints not available.", true);
 
@@ -1473,7 +1470,7 @@ static std::string HandleRemoveGEBreakpoint(const JsonGet &args) {
 }
 
 static std::string HandleSetGEBreakOn(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	std::string event;
@@ -1496,8 +1493,8 @@ static std::string HandleSetGEBreakOn(const JsonGet &args) {
 	else
 		return ToolResultText("Invalid event. Use: op, draw, tex, nontex, frame, vsync, prim, curve, blocktransfer.", true);
 
-	gpuDebug->SetBreakNext(breakNext);
-	gpuDebug->SetBreakCount(count);
+	gpu->SetBreakNext(breakNext);
+	gpu->SetBreakCount(count);
 
 	char msg[128];
 	snprintf(msg, sizeof(msg), "GE will break on next '%s' event (count=%d).", event.c_str(), count);
@@ -1505,35 +1502,42 @@ static std::string HandleSetGEBreakOn(const JsonGet &args) {
 }
 
 static std::string HandleGetGPUStats(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	char stats[4096];
-	gpuDebug->GetStats(stats, sizeof(stats));
+	StringWriter statsWriter(stats);
+	gpu->GetStats(statsWriter);
 
 	JsonWriter j;
 	j.begin();
 	j.writeString("stats", stats);
-	j.writeInt("prims_this_frame", gpuDebug->PrimsThisFrame());
-	j.writeInt("prims_last_frame", gpuDebug->PrimsLastFrame());
+	j.writeInt("prims_this_frame", gpu->PrimsThisFrame());
+	j.writeInt("prims_last_frame", gpu->PrimsLastFrame());
 	j.end();
 	return ToolResultText(j.str());
 }
 
 static std::string HandleGetCurrentVertices(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping())
 		return ToolResultText("Emulator must be paused (use the pause tool first).", true);
 
-	int count = gpuDebug->GetCurrentPrimCount();
+	GEPrimitiveType prim = GE_PRIM_TRIANGLES;
+	GECommand drawCmd = GE_CMD_NOP;
+	int count = gpu->GetCurrentPrim(&prim, &drawCmd);
 	if (count <= 0)
 		return ToolResultText("No draw call in progress. Break on a draw command first (use set_ge_break_on with 'draw').", true);
 
 	std::vector<GPUDebugVertex> vertices;
 	std::vector<u16> indices;
-	if (!gpuDebug->GetCurrentDrawAsDebugVertices(count, vertices, indices))
+	GEPrimitiveType outPrim = prim;
+	int lowerIndexBound = 0;
+	TransformStats transformStats{};
+	if (!gpu->GetCurrentDrawAsDebugVertices(drawCmd, prim, &outPrim, count, &vertices, &indices,
+	                                        &lowerIndexBound, &transformStats, (DebugVertexFlags)0))
 		return ToolResultText("Failed to get vertex data.", true);
 
 	JsonWriter j;
@@ -1552,7 +1556,7 @@ static std::string HandleGetCurrentVertices(const JsonGet &args) {
 		j.writeFloat("ny", v.ny);
 		j.writeFloat("nz", v.nz);
 		char color[16];
-		snprintf(color, sizeof(color), "#%02X%02X%02X%02X", v.c[0], v.c[1], v.c[2], v.c[3]);
+		snprintf(color, sizeof(color), "#%02X%02X%02X%02X", v.c0[0], v.c0[1], v.c0[2], v.c0[3]);
 		j.writeString("color", color);
 		j.pop();
 	}
@@ -1580,14 +1584,14 @@ static void WriteMatrix(JsonWriter &j, const char *name, const float *m, int row
 }
 
 static std::string HandleGetGPUMatrices(const JsonGet &args) {
-	if (PSP_GetBootState() != BootState::Complete || !gpuDebug)
+	if (PSP_GetBootState() != BootState::Complete || !gpu)
 		return ToolResultText("No game loaded.", true);
 
 	std::string name;
 	args.getString("name", &name);
 	if (name.empty()) name = "all";
 
-	const GPUgstate &gs = gpuDebug->GetGState();
+	const GEState &gs = gpu->GetGState();
 
 	JsonWriter j;
 	j.begin();
