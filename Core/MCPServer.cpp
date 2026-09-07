@@ -16,6 +16,8 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -52,6 +54,7 @@
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/HLE.h"
+#include "Core/HLE/sceCtrl.h"
 #include "Core/Screenshot.h"
 #include "Common/Data/Text/StringWriter.h"
 #include "GPU/GPU.h"
@@ -203,6 +206,27 @@ static std::vector<MCPToolDef> GetToolDefs() {
 			{"address", "string", "Address to look up. Hex with 0x prefix or decimal.", false},
 			{"name", "string", "Symbol name to look up.", false},
 		}},
+		{"press_button", "Hold a PSP button down. It stays held until release_button. Combine buttons with '+' (e.g. \"ltrigger+rtrigger\").", {
+			{"button", "string", "Button name: cross (x), circle (o), square, triangle, up, down, left, right, start, select, ltrigger (l), rtrigger (r).", true},
+		}},
+		{"release_button", "Release a PSP button previously held with press_button.", {
+			{"button", "string", "Button name, same vocabulary as press_button.", true},
+		}},
+		{"tap_button", "Press a button, wait, then release it. Requires emulation to be running, since a held button only registers while frames advance.", {
+			{"button", "string", "Button name, same vocabulary as press_button.", true},
+			{"duration_ms", "number", "How long to hold it, in milliseconds (default 120, clamped 16-5000).", false},
+		}},
+		{"input_sequence", "Play a series of button presses, for navigating menus in one call. The sequence is a comma separated list of steps; each step is a button, optionally with its own duration as 'button:ms', or 'wait:ms' to pause. Example: \"start, down, down, cross:200, wait:1500, circle\".", {
+			{"sequence", "string", "Comma separated steps, at most 64, 60 seconds total.", true},
+			{"hold_ms", "number", "Default hold time per button in milliseconds (default 120).", false},
+			{"gap_ms", "number", "Pause between steps in milliseconds (default 80).", false},
+		}},
+		{"set_analog", "Set the position of an analog stick. Values are -1 to 1; (0,0) recenters it.", {
+			{"stick", "number", "0 for the left stick (default), 1 for the right.", false},
+			{"x", "number", "Horizontal position, -1 (left) to 1 (right).", false},
+			{"y", "number", "Vertical position, -1 (up) to 1 (down).", false},
+		}},
+		{"get_input_state", "Read which buttons are currently held and where the analog sticks are.", {}},
 		{"take_screenshot", "Capture a screenshot of the current PSP display as a PNG image.", {
 			{"type", "string", "Screenshot type: 'display' (default, game output) or 'render' (in-progress render).", false},
 		}},
@@ -607,6 +631,242 @@ static std::string HandleSearchMemory(const JsonGet &args) {
 	}
 	j.pop();
 	j.writeInt("count", found);
+	j.end();
+	return ToolResultText(j.str());
+}
+
+// Controller input. The button state set here sticks until changed again -- the
+// UI only touches it when real input events arrive, so injected presses survive.
+
+struct MCPButtonName {
+	const char *name;
+	u32 bit;
+};
+
+static const MCPButtonName g_mcpButtons[] = {
+	{"cross", CTRL_CROSS}, {"x", CTRL_CROSS},
+	{"circle", CTRL_CIRCLE}, {"o", CTRL_CIRCLE},
+	{"square", CTRL_SQUARE},
+	{"triangle", CTRL_TRIANGLE},
+	{"up", CTRL_UP}, {"down", CTRL_DOWN}, {"left", CTRL_LEFT}, {"right", CTRL_RIGHT},
+	{"start", CTRL_START}, {"select", CTRL_SELECT},
+	{"ltrigger", CTRL_LTRIGGER}, {"l", CTRL_LTRIGGER},
+	{"rtrigger", CTRL_RTRIGGER}, {"r", CTRL_RTRIGGER},
+};
+
+static std::string MCPTrimLower(const std::string &s) {
+	size_t b = s.find_first_not_of(" \t\r\n");
+	if (b == std::string::npos)
+		return std::string();
+	size_t e = s.find_last_not_of(" \t\r\n");
+	std::string out = s.substr(b, e - b + 1);
+	for (char &c : out)
+		c = (char)tolower((unsigned char)c);
+	return out;
+}
+
+// One button, or several joined with '+' such as "ltrigger+rtrigger".
+static bool MCPParseButtons(const std::string &spec, u32 *outBits, std::string *unknown) {
+	u32 bits = 0;
+	size_t start = 0;
+	while (true) {
+		size_t plus = spec.find('+', start);
+		std::string one = MCPTrimLower(spec.substr(start, plus == std::string::npos ? std::string::npos : plus - start));
+		if (!one.empty()) {
+			bool found = false;
+			for (const auto &b : g_mcpButtons) {
+				if (one == b.name) {
+					bits |= b.bit;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				*unknown = one;
+				return false;
+			}
+		}
+		if (plus == std::string::npos)
+			break;
+		start = plus + 1;
+	}
+	*outBits = bits;
+	return bits != 0;
+}
+
+static int MCPClampMs(int ms, int lo, int hi) {
+	return ms < lo ? lo : (ms > hi ? hi : ms);
+}
+
+// Holding a button only means something while frames are being produced.
+static bool MCPInputReady(std::string *err) {
+	if (PSP_GetBootState() != BootState::Complete) {
+		*err = "No game loaded.";
+		return false;
+	}
+	if (Core_IsStepping()) {
+		*err = "Emulation is paused, so no frames would advance. Resume first.";
+		return false;
+	}
+	return true;
+}
+
+static std::string HandlePressButton(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+	std::string spec;
+	if (!args.getString("button", &spec))
+		return ToolResultText("Missing 'button' parameter.", true);
+	u32 bits = 0;
+	std::string unknown;
+	if (!MCPParseButtons(spec, &bits, &unknown))
+		return ToolResultText(unknown.empty() ? "No button given." : "Unknown button: " + unknown, true);
+	__CtrlUpdateButtons(bits, 0);
+	return ToolResultText("Holding " + spec + ".");
+}
+
+static std::string HandleReleaseButton(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+	std::string spec;
+	if (!args.getString("button", &spec))
+		return ToolResultText("Missing 'button' parameter.", true);
+	u32 bits = 0;
+	std::string unknown;
+	if (!MCPParseButtons(spec, &bits, &unknown))
+		return ToolResultText(unknown.empty() ? "No button given." : "Unknown button: " + unknown, true);
+	__CtrlUpdateButtons(0, bits);
+	return ToolResultText("Released " + spec + ".");
+}
+
+static std::string HandleTapButton(const JsonGet &args) {
+	std::string err;
+	if (!MCPInputReady(&err))
+		return ToolResultText(err, true);
+	std::string spec;
+	if (!args.getString("button", &spec))
+		return ToolResultText("Missing 'button' parameter.", true);
+	u32 bits = 0;
+	std::string unknown;
+	if (!MCPParseButtons(spec, &bits, &unknown))
+		return ToolResultText(unknown.empty() ? "No button given." : "Unknown button: " + unknown, true);
+	int ms = MCPClampMs(args.getInt("duration_ms", 120), 16, 5000);
+	__CtrlUpdateButtons(bits, 0);
+	std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+	__CtrlUpdateButtons(0, bits);
+	return ToolResultText("Tapped " + spec + " for " + std::to_string(ms) + " ms.");
+}
+
+static std::string HandleInputSequence(const JsonGet &args) {
+	std::string err;
+	if (!MCPInputReady(&err))
+		return ToolResultText(err, true);
+	std::string seq;
+	if (!args.getString("sequence", &seq) || seq.empty())
+		return ToolResultText("Missing 'sequence' parameter.", true);
+	int holdMs = MCPClampMs(args.getInt("hold_ms", 120), 16, 5000);
+	int gapMs = MCPClampMs(args.getInt("gap_ms", 80), 0, 5000);
+
+	std::vector<std::pair<u32, int>> steps;  // bits (0 means wait), milliseconds
+	int totalMs = 0;
+	size_t start = 0;
+	while (true) {
+		size_t comma = seq.find(',', start);
+		std::string step = seq.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+		std::string name = step;
+		int ms = -1;
+		size_t colon = step.find(':');
+		if (colon != std::string::npos) {
+			name = step.substr(0, colon);
+			ms = atoi(MCPTrimLower(step.substr(colon + 1)).c_str());
+		}
+		name = MCPTrimLower(name);
+		if (!name.empty()) {
+			if (steps.size() >= 64)
+				return ToolResultText("Sequence is too long (64 steps max).", true);
+			if (name == "wait") {
+				steps.push_back({0, MCPClampMs(ms < 0 ? gapMs : ms, 0, 10000)});
+			} else {
+				u32 bits = 0;
+				std::string unknown;
+				if (!MCPParseButtons(name, &bits, &unknown))
+					return ToolResultText("Unknown button in sequence: " + unknown, true);
+				steps.push_back({bits, MCPClampMs(ms < 0 ? holdMs : ms, 16, 5000)});
+			}
+			totalMs += steps.back().second + gapMs;
+			if (totalMs > 60000)
+				return ToolResultText("Sequence would take over 60 seconds.", true);
+		}
+		if (comma == std::string::npos)
+			break;
+		start = comma + 1;
+	}
+	if (steps.empty())
+		return ToolResultText("Sequence is empty.", true);
+
+	int done = 0;
+	for (const auto &step : steps) {
+		if (Core_IsStepping())
+			return ToolResultText("Emulation stopped after " + std::to_string(done) +
+			                      " of " + std::to_string(steps.size()) + " steps (a breakpoint hit?).", true);
+		if (step.first == 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(step.second));
+		} else {
+			__CtrlUpdateButtons(step.first, 0);
+			std::this_thread::sleep_for(std::chrono::milliseconds(step.second));
+			__CtrlUpdateButtons(0, step.first);
+			if (gapMs > 0)
+				std::this_thread::sleep_for(std::chrono::milliseconds(gapMs));
+		}
+		done++;
+	}
+	return ToolResultText("Played " + std::to_string(done) + " steps.");
+}
+
+static std::string HandleSetAnalog(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+	int stick = args.getInt("stick", 0);
+	if (stick < 0 || stick > 1)
+		return ToolResultText("stick must be 0 (left) or 1 (right).", true);
+	double x = args.getFloat("x", 0.0);
+	double y = args.getFloat("y", 0.0);
+	x = x < -1.0 ? -1.0 : (x > 1.0 ? 1.0 : x);
+	y = y < -1.0 ? -1.0 : (y > 1.0 ? 1.0 : y);
+	__CtrlSetAnalogXY(stick, (float)x, (float)y);
+	char buf[128];
+	snprintf(buf, sizeof(buf), "Analog stick %d set to (%.3f, %.3f).", stick, x, y);
+	return ToolResultText(buf);
+}
+
+static std::string HandleGetInputState(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+	u32 bits = __CtrlPeekButtons();
+	float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f;
+	__CtrlPeekAnalog(0, &lx, &ly);
+	__CtrlPeekAnalog(1, &rx, &ry);
+
+	JsonWriter j;
+	j.begin();
+	j.writeString("buttons_hex", StringFromFormat("0x%08X", bits));
+	j.pushArray("pressed");
+	for (const auto &b : g_mcpButtons) {
+		// Skip the short aliases so each button is listed once.
+		if (strlen(b.name) <= 1)
+			continue;
+		if (bits & b.bit)
+			j.writeString(b.name);
+	}
+	j.pop();
+	j.pushDict("analog_left");
+	j.writeFloat("x", lx);
+	j.writeFloat("y", ly);
+	j.pop();
+	j.pushDict("analog_right");
+	j.writeFloat("x", rx);
+	j.writeFloat("y", ry);
+	j.pop();
 	j.end();
 	return ToolResultText(j.str());
 }
@@ -1638,6 +1898,12 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"remove_memcheck", HandleRemoveMemcheck},
 		{"list_breakpoints", HandleListBreakpoints},
 		{"lookup_symbol", HandleLookupSymbol},
+		{"press_button", HandlePressButton},
+		{"release_button", HandleReleaseButton},
+		{"tap_button", HandleTapButton},
+		{"input_sequence", HandleInputSequence},
+		{"set_analog", HandleSetAnalog},
+		{"get_input_state", HandleGetInputState},
 		{"take_screenshot", HandleTakeScreenshot},
 		{"list_framebuffers", HandleListFramebuffers},
 		{"get_framebuffer", HandleGetFramebuffer},
