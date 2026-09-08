@@ -50,6 +50,7 @@
 #include "Core/Debugger/DisassemblyManager.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/ELF/ParamSFO.h"
+#include "Core/SaveState.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelThread.h"
@@ -69,6 +70,7 @@
 #include "GPU/GeDisasm.h"
 #include "Core/Util/PathUtil.h"
 #include "Common/File/FileUtil.h"
+#include "Common/File/DirListing.h"
 
 using json::JsonWriter;
 using json::JsonReader;
@@ -179,6 +181,15 @@ static std::vector<MCPToolDef> GetToolDefs() {
 		{"pause", "Pause emulation (break into stepping mode).", {}},
 		{"resume", "Resume emulation from paused/stepping state.", {}},
 		{"step_into", "Step one instruction (into function calls). Must be paused first.", {}},
+		{"save_state", "Save a save state. Writes to the given path, or to a numbered slot.", {
+			{"slot", "number", "Slot to save into (defaults to the emulator's current slot). Ignored when 'path' is given.", false},
+			{"path", "string", "Explicit file to write instead of a slot, e.g. \"/tmp/options.ppst\". Bypasses the slot machinery and its undo copies.", false},
+		}},
+		{"load_state", "Load a save state, from the given path or from a numbered slot.", {
+			{"slot", "number", "Slot to load from (defaults to the emulator's current slot). Ignored when 'path' is given.", false},
+			{"path", "string", "Explicit file to read instead of a slot.", false},
+		}},
+		{"list_save_states", "List the save state slots for the running game, with their timestamps.", {}},
 		{"list_threads", "List PSP kernel threads with their status and PC.", {}},
 		{"set_breakpoint", "Set a CPU execution breakpoint at the given address.", {
 			{"address", "string", "Address to set breakpoint at. Hex with 0x prefix or decimal.", true},
@@ -909,6 +920,113 @@ static std::string HandleStepInto(const JsonGet &args) {
 	char msg[128];
 	snprintf(msg, sizeof(msg), "Stepped to 0x%08X.", currentDebugMIPS->GetPC());
 	return ToolResultText(msg);
+}
+
+// Save state operations are queued and run by the emulator between frames, so
+// the answer only means something once the callback has come back. It runs on
+// the emulator thread, hence the promise. Stepping is fine: the stepping loop
+// pumps SaveState::Process() too.
+static std::string MCPRunSaveStateOp(const JsonGet &args, bool load) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+
+	std::string path;
+	const bool hasPath = args.getString("path", &path) && !path.empty();
+	const int slot = args.getInt("slot", g_Config.iCurrentStateSlot);
+	if (!hasPath && (slot < 0 || slot >= g_Config.iSaveStateSlotCount)) {
+		return ToolResultText("slot must be between 0 and " +
+			std::to_string(g_Config.iSaveStateSlotCount - 1) + ".", true);
+	}
+
+	const std::string prefix = SaveState::GetGamePrefix(g_paramSFO);
+	// "ppst" is STATE_EXTENSION, which SaveState.cpp keeps to itself.
+	Path file = hasPath ? Path(path) : SaveState::GenerateSaveSlotPath(prefix, slot, "ppst");
+	if (file.empty())
+		return ToolResultText("Could not work out the save state path.", true);
+	if (load && !File::Exists(file))
+		return ToolResultText("No save state at " + file.ToVisualString() + ".", true);
+
+	auto promise = std::make_shared<std::promise<std::pair<int, std::string>>>();
+	auto done = promise->get_future();
+	auto callback = [promise](SaveState::Status status, std::string_view message, std::string_view) {
+		promise->set_value({(int)status, std::string(message)});
+	};
+
+	if (hasPath) {
+		if (load)
+			SaveState::Load(file, slot, callback);
+		else
+			SaveState::Save(file, slot, callback);
+	} else {
+		if (load)
+			SaveState::LoadSlot(prefix, slot, callback);
+		else
+			SaveState::SaveSlot(prefix, slot, callback);
+	}
+
+	// Nothing calls the callback when the operation is refused outright, which
+	// happens under netplay and in achievements hardcore mode, so say so.
+	if (done.wait_for(std::chrono::seconds(15)) != std::future_status::ready) {
+		return ToolResultText("Timed out waiting for the save state. Either the emulator is not "
+			"running frames, or save states are blocked (netplay, or achievements hardcore mode).", true);
+	}
+	auto result = done.get();
+
+	JsonWriter j;
+	j.begin();
+	j.writeString("result", result.first == (int)SaveState::Status::FAILURE ? "failure" :
+		(result.first == (int)SaveState::Status::WARNING ? "warning" : "success"));
+	j.writeString("path", file.ToVisualString());
+	if (!hasPath)
+		j.writeInt("slot", slot);
+	if (!result.second.empty())
+		j.writeString("message", result.second);
+	j.end();
+	return ToolResultText(j.str(), result.first == (int)SaveState::Status::FAILURE);
+}
+
+static std::string HandleSaveState(const JsonGet &args) {
+	return MCPRunSaveStateOp(args, false);
+}
+
+static std::string HandleLoadState(const JsonGet &args) {
+	return MCPRunSaveStateOp(args, true);
+}
+
+static std::string HandleListSaveStates(const JsonGet &args) {
+	if (PSP_GetBootState() != BootState::Complete)
+		return ToolResultText("No game loaded.", true);
+
+	// Deliberately not SaveState::HasSaveInSlot: that reads a directory listing
+	// cached by Rescan, which is refreshed before the asynchronous write has
+	// actually happened, so a state saved a moment ago reads as absent. Going to
+	// the filesystem also keeps this off the map the emulator thread owns.
+	const std::string prefix = SaveState::GetGamePrefix(g_paramSFO);
+	JsonWriter j;
+	j.begin();
+	j.writeInt("current_slot", g_Config.iCurrentStateSlot);
+	j.pushArray("slots");
+	for (int slot = 0; slot < g_Config.iSaveStateSlotCount; slot++) {
+		j.pushDict();
+		j.writeInt("slot", slot);
+		const Path file = SaveState::GenerateSaveSlotPath(prefix, slot, "ppst");
+		File::FileInfo info;
+		const bool used = !file.empty() && File::GetFileInfo(file, &info) && info.exists;
+		j.writeBool("used", used);
+		if (used) {
+			char when[64] = "";
+			const time_t mtime = (time_t)info.mtime;
+			struct tm local;
+			if (localtime_r(&mtime, &local))
+				strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &local);
+			j.writeString("saved", when);
+			j.writeString("path", file.ToVisualString());
+		}
+		j.pop();
+	}
+	j.pop();
+	j.end();
+	return ToolResultText(j.str());
 }
 
 static std::string HandleListThreads(const JsonGet &args) {
@@ -1891,6 +2009,9 @@ static std::map<std::string, ToolHandler> &GetToolHandlers() {
 		{"pause", HandlePause},
 		{"resume", HandleResume},
 		{"step_into", HandleStepInto},
+		{"save_state", HandleSaveState},
+		{"load_state", HandleLoadState},
+		{"list_save_states", HandleListSaveStates},
 		{"list_threads", HandleListThreads},
 		{"set_breakpoint", HandleSetBreakpoint},
 		{"remove_breakpoint", HandleRemoveBreakpoint},
