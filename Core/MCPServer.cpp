@@ -36,6 +36,7 @@
 #include "Common/StringUtils.h"
 #include "Common/Thread/ThreadUtil.h"
 #include "Common/System/OSD.h"
+#include "Common/System/System.h"
 #include "Core/MCPServer.h"
 #include "Core/Config.h"
 #include "Common/TimeUtil.h"
@@ -895,6 +896,15 @@ static std::string HandlePause(const JsonGet &args) {
 static std::string HandleResume(const JsonGet &args) {
 	if (PSP_GetBootState() != BootState::Complete)
 		return ToolResultText("No game loaded.", true);
+
+	// Two different things stop a game: the debugger (stepping) and PPSSPP's own
+	// pause menu. Core_Resume() only knows about the first, so a game sitting in
+	// the pause menu could not be resumed from here at all.
+	if (GetUIState() == UISTATE_PAUSEMENU) {
+		System_PostUIMessage(UIMessage::REQUEST_GAME_RUN);
+		return ToolResultText("Closed the pause menu.");
+	}
+
 	if (!Core_IsStepping())
 		return ToolResultText("Not paused.");
 

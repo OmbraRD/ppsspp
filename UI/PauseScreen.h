@@ -45,6 +45,7 @@ public:
 protected:
 	void CreateViews() override;
 	void update() override;
+	void sendMessage(UIMessage message, const char *value) override;
 	UI::Margins RootMargins() const override;
 	ViewLayoutMode LayoutMode() const override {
 		return ViewLayoutMode::ApplyInsets;

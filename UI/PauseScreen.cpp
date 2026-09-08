@@ -821,6 +821,16 @@ void GamePauseScreen::AddExtraOptions(UI::ViewGroup *parent) {
 	}
 }
 
+void GamePauseScreen::sendMessage(UIMessage message, const char *value) {
+	UIBaseDialogScreen::sendMessage(message, value);
+
+	// The counterpart of REQUEST_GAME_PAUSE, which EmuScreen answers by pushing
+	// this screen: closing it is what the Continue button does.
+	if (message == UIMessage::REQUEST_GAME_RUN && screenManager()->topScreen() == this) {
+		TriggerFinish(DR_CANCEL);
+	}
+}
+
 void GamePauseScreen::OnGameSettings(UI::EventParams &e) {
 	screenManager()->push(new GameSettingsScreen(gamePath_));
 }
